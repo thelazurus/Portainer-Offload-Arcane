@@ -7,12 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-12
+
 ### Added
+- `migrate.sh` launcher script
+  - Checks Python 3.8+ availability across `python3` and `python` candidates
+  - Checks and installs pip via `ensurepip` if missing
+  - Auto-installs `rich` and `requests` from `requirements.txt`
+  - Detects Docker availability and reports mode (local vs API-only)
+  - Passes all CLI args through to `migrate.py`
+  - Color output with graceful degradation on non-TTY
+  - Platform-specific install guidance (macOS/Linux/Windows)
 - WizardUI: Rich TUI wizard with phase headers, progress bars, tables, edition panels
 - ReportGenerator: JSON migration report, rollback shell script
 - MigrationEngine: Full orchestrator with checkpoint/resume, discovery, transforms, export, live migration
+  - 13 migration phases (registries, git repos, networks, volumes, stacks, GitOps syncs, containers, templates, users, webhooks, EE RBAC, EE audit)
+  - Export-to-disk with full directory structure
+  - Edition-aware CE/EE branching
+  - Pre-flight checks (Arcane health, naming conflicts, disk space)
 - Main entry point wiring with config file loading and error handling
-- README documentation
+- README, CHANGELOG, CLAUDE.md documentation
 
 ## [0.1.0] - 2026-04-12
 
