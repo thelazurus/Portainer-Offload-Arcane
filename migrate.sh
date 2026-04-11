@@ -28,6 +28,61 @@ success() { echo -e "  ${GREEN}✔${RESET} $*"; }
 warn()    { echo -e "  ${YELLOW}⚠${RESET} $*"; }
 fail()    { echo -e "  ${RED}✘${RESET} $*"; }
 
+# ── Help ────────────────────────────────────────────────────
+show_help() {
+    echo ""
+    echo -e "${CYAN}${BOLD}  Portainer → Arcane Migration Tool${RESET}"
+    echo -e "${DIM}  Launcher v1.0${RESET}"
+    echo ""
+    echo -e "  ${BOLD}USAGE${RESET}"
+    echo "    ./migrate.sh [OPTIONS]"
+    echo ""
+    echo -e "  ${BOLD}DESCRIPTION${RESET}"
+    echo "    Checks prerequisites (Python 3.8+, pip, rich, requests),"
+    echo "    installs missing dependencies, then launches the migration"
+    echo "    wizard. All options are passed through to migrate.py."
+    echo ""
+    echo -e "  ${BOLD}LAUNCHER OPTIONS${RESET}"
+    echo "    -h, --help         Show this help and exit"
+    echo "    --check-only       Check prerequisites without launching"
+    echo ""
+    echo -e "  ${BOLD}MIGRATION OPTIONS${RESET} ${DIM}(passed to migrate.py)${RESET}"
+    echo "    --dry-run          Simulate without making changes"
+    echo "    --export-only      Export from Portainer only (no Arcane import)"
+    echo "    --resume           Resume an interrupted migration"
+    echo "    --skip-backup      Skip the Portainer backup step"
+    echo "    --import-dir PATH  Import from a previous export directory"
+    echo "    --config FILE      Load connection config from JSON"
+    echo "    --version          Show version and exit"
+    echo ""
+    echo -e "  ${BOLD}EXAMPLES${RESET}"
+    echo "    ./migrate.sh                     Interactive wizard"
+    echo "    ./migrate.sh --dry-run           Simulate the full migration"
+    echo "    ./migrate.sh --export-only       Export data only, don't touch Arcane"
+    echo "    ./migrate.sh --check-only        Just verify prerequisites"
+    echo "    ./migrate.sh --resume            Pick up where you left off"
+    echo ""
+    echo -e "  ${BOLD}PREREQUISITES${RESET}"
+    echo "    Python 3.8+       Checked automatically"
+    echo "    pip               Installed via ensurepip if missing"
+    echo "    rich, requests    Installed from requirements.txt if missing"
+    echo "    Docker (optional) Enables volume data backup when available"
+    echo ""
+}
+
+CHECK_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --check-only)
+            CHECK_ONLY=true
+            ;;
+    esac
+done
+
 # ── Banner ──────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}${BOLD}  Portainer → Arcane Migration Tool${RESET}"
@@ -140,6 +195,14 @@ else
     info "API-only migration mode (stacks, configs, metadata still work)"
 fi
 
+# ── Check-only exit ─────────────────────────────────────────
+if [ "$CHECK_ONLY" = true ]; then
+    echo ""
+    success "All prerequisites satisfied. Ready to migrate."
+    echo ""
+    exit 0
+fi
+
 # ── Launch ──────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}─────────────────────────────────────────────${RESET}"
@@ -147,4 +210,13 @@ echo -e "  ${BOLD}Launching migration wizard...${RESET}"
 echo -e "${CYAN}─────────────────────────────────────────────${RESET}"
 echo ""
 
-exec "$PYTHON" "$MIGRATE_PY" "$@"
+# Strip launcher-only flags before passing to migrate.py
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --check-only) ;;  # consumed by launcher
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+exec "$PYTHON" "$MIGRATE_PY" "${ARGS[@]+"${ARGS[@]}"}"
