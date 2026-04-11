@@ -2683,6 +2683,335 @@ class MigrationEngine:
         self.ui.info("EE audit export skipped (API varies by EE version)")
         self._mark_phase(phase, "completed")
 
+    # ------------------------------------------------------------------
+    # Task 12: Pre-flight checks
+    # ------------------------------------------------------------------
+
+    def preflight_checks(self) -> list:
+        """Run pre-flight checks before live migration.
+
+        Returns a list of dicts with keys: name, status (pass|warn|fail), details.
+        """
+        results: List[Dict[str, str]] = []
+
+        # 1. Arcane API health
+        try:
+            self.arcane.health_check()
+            results.append({
+                "name": "Arcane API Health",
+                "status": "pass",
+                "details": "Arcane API is reachable and healthy",
+            })
+        except Exception as exc:
+            results.append({
+                "name": "Arcane API Health",
+                "status": "fail",
+                "details": f"Arcane API health check failed: {exc}",
+            })
+
+        # 2. Arcane environment accessible
+        try:
+            eid = self.config.arcane_environment_id or "0"
+            self.arcane.get_environment(eid)
+            results.append({
+                "name": "Arcane Environment",
+                "status": "pass",
+                "details": f"Environment '{eid}' is accessible",
+            })
+        except Exception as exc:
+            results.append({
+                "name": "Arcane Environment",
+                "status": "fail",
+                "details": f"Cannot access Arcane environment: {exc}",
+            })
+
+        # 3. Naming conflicts
+        try:
+            eid = self.config.arcane_environment_id or "0"
+            existing_projects = self.arcane.list_projects(eid)
+            existing_names = {
+                p.get("name", "").lower() for p in existing_projects
+            }
+            portainer_stacks = self.discovery.get("stacks", {}).get("items", [])
+            conflicts = [
+                s.get("Name", s.get("name", ""))
+                for s in portainer_stacks
+                if s.get("Name", s.get("name", "")).lower() in existing_names
+            ]
+            if conflicts:
+                results.append({
+                    "name": "Naming Conflicts",
+                    "status": "warn",
+                    "details": f"Conflicting stack names: {', '.join(conflicts)}",
+                })
+            else:
+                results.append({
+                    "name": "Naming Conflicts",
+                    "status": "pass",
+                    "details": "No naming conflicts detected",
+                })
+        except Exception as exc:
+            results.append({
+                "name": "Naming Conflicts",
+                "status": "warn",
+                "details": f"Could not check naming conflicts: {exc}",
+            })
+
+        # 4. Disk space
+        try:
+            backup_parent = Path(self.config.backup_dir).parent
+            backup_parent.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(str(backup_parent))
+            free_gb = usage.free / (1024 ** 3)
+            if free_gb < 1.0:
+                results.append({
+                    "name": "Disk Space",
+                    "status": "warn",
+                    "details": f"Low disk space: {free_gb:.2f} GB free",
+                })
+            else:
+                results.append({
+                    "name": "Disk Space",
+                    "status": "pass",
+                    "details": f"{free_gb:.1f} GB free",
+                })
+        except Exception as exc:
+            results.append({
+                "name": "Disk Space",
+                "status": "warn",
+                "details": f"Could not check disk space: {exc}",
+            })
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Task 12: Main orchestrator
+    # ------------------------------------------------------------------
+
+    def run(self, args=None):
+        """Run the full migration wizard."""
+        try:
+            # ── Phase 0: Welcome ──────────────────────────────────
+            self.ui.banner()
+
+            # Check for existing checkpoint
+            cp = self.config.checkpoint_file
+            if os.path.isfile(cp):
+                resume = Confirm.ask(
+                    "[yellow]Existing checkpoint found.[/] Resume previous migration?",
+                    default=True,
+                )
+                if not resume:
+                    os.remove(cp)
+                    self.state = self._load_state()
+                    self.ui.info("Starting fresh migration")
+                else:
+                    self.ui.info("Resuming from checkpoint")
+
+            # ── Phase 1: Connection Setup ─────────────────────────
+            self.ui.phase_header("1", 7, "Connection Setup")
+
+            # Portainer connection
+            self.ui.ask_portainer_connection()
+            self.portainer = PortainerClient(self.config, self.logger)
+
+            try:
+                info = self.portainer.test_connection()
+                self.ui.success(f"Connected to Portainer at {self.config.portainer_url}")
+            except Exception as exc:
+                self.ui.error(f"Cannot connect to Portainer: {exc}")
+                return
+
+            try:
+                edition_info = self.portainer.detect_edition()
+                self.ui.show_edition_panel(
+                    self.config.portainer_edition,
+                    self.config.portainer_version,
+                )
+                self.ui.success(
+                    f"Portainer {self.config.portainer_edition} "
+                    f"v{self.config.portainer_version} detected"
+                )
+            except Exception as exc:
+                self.ui.error(f"Cannot detect Portainer edition: {exc}")
+                return
+
+            endpoints = self.portainer.list_endpoints()
+            if not endpoints:
+                self.ui.error("No Portainer endpoints found. Cannot continue.")
+                return
+
+            self.config.portainer_endpoint_id = self.ui.select_endpoint(endpoints)
+            self.portainer = PortainerClient(self.config, self.logger)
+
+            # Arcane connection
+            self.ui.ask_arcane_connection()
+            self.arcane = ArcaneClient(self.config, self.logger)
+
+            if self.config.arcane_username and self.config.arcane_password:
+                try:
+                    self.arcane.login(
+                        self.config.arcane_username,
+                        self.config.arcane_password,
+                    )
+                    self.ui.success("Authenticated with Arcane")
+                except Exception as exc:
+                    self.ui.error(f"Arcane login failed: {exc}")
+                    return
+
+            try:
+                version_info = self.arcane.get_version()
+                version_str = (
+                    version_info
+                    if isinstance(version_info, str)
+                    else version_info.get("version", "unknown")
+                    if isinstance(version_info, dict)
+                    else str(version_info)
+                )
+                self.ui.success(f"Connected to Arcane v{version_str}")
+            except Exception as exc:
+                self.ui.error(f"Cannot connect to Arcane: {exc}")
+                return
+
+            # Select Arcane environment
+            try:
+                arcane_envs = self.arcane.list_environments()
+                self.config.arcane_environment_id = self.ui.select_arcane_environment(
+                    arcane_envs
+                )
+            except Exception as exc:
+                self.logger.debug("Could not list Arcane environments: %s", exc)
+                self.config.arcane_environment_id = "0"
+                self.ui.info("Using default Arcane environment (0)")
+
+            # ── Phase 1.5: Portainer Backup ───────────────────────
+            skip_backup = args and getattr(args, "skip_backup", False)
+            if not skip_backup:
+                self.ui.phase_header("1.5", 7, "Portainer Backup")
+                do_backup = Confirm.ask(
+                    "Create a Portainer backup before proceeding?",
+                    default=True,
+                )
+                if do_backup:
+                    try:
+                        self._portainer_backup()
+                    except Exception as exc:
+                        self.ui.error(f"Portainer backup failed: {exc}")
+                        if not Confirm.ask("Continue without backup?", default=False):
+                            return
+                else:
+                    self.ui.warning("Skipping Portainer backup (user choice)")
+                    self._mark_phase("portainer_backup", "completed")
+
+            # ── Phase 2: Discovery ────────────────────────────────
+            self.discovery = self.discover()
+
+            # ── Phase 3: Strategy Selection ───────────────────────
+            self.ui.phase_header(3, 7, "Strategy Selection")
+            self.ui.ask_strategy()
+            selected = self.ui.ask_scope_confirmation(
+                self.discovery,
+                self.config.portainer_edition,
+            )
+            if not selected:
+                self.ui.warning("No items selected for migration. Exiting.")
+                return
+            self.ui.show_migration_plan(self.config)
+
+            # ── Phase 4: Pre-Flight Checks ────────────────────────
+            if self.config.strategy == "live":
+                self.ui.phase_header(4, 7, "Pre-Flight Checks")
+                results = self.preflight_checks()
+                if not self.ui.show_preflight_results(results):
+                    return
+
+            # ── Phase 5: Execution ────────────────────────────────
+            self.ui.phase_header(5, 7, "Execution")
+
+            # Always export first
+            self._export_to_disk()
+
+            if self.config.strategy == "live":
+                # Build phase list dynamically
+                core_phases = [
+                    ("5a: Registries", self._migrate_registries),
+                    ("5b: Git Repos", self._migrate_git_repos),
+                    ("5c: Networks", self._migrate_networks),
+                    ("5d: Volumes", self._migrate_volumes),
+                    ("5e: Stacks", self._migrate_stacks),
+                    ("5f: GitOps Syncs", self._migrate_gitops_syncs),
+                    ("5g: Containers", self._migrate_containers),
+                    ("5h: Templates", self._migrate_templates),
+                    ("5i: Users", self._migrate_users),
+                ]
+                ee_phases: list = []
+                if self._is_ee():
+                    ee_phases = [
+                        ("5j: Webhooks", self._migrate_webhooks),
+                        ("5k: EE RBAC Export", self._export_ee_rbac),
+                        ("5l: EE Audit Export", self._export_ee_audit),
+                    ]
+                else:
+                    ee_phases = [
+                        ("5j: Webhooks", self._migrate_webhooks),
+                    ]
+                phases = core_phases + ee_phases
+
+                with self.ui.create_progress() as progress:
+                    task = progress.add_task(
+                        "Migrating...", total=len(phases)
+                    )
+                    for label, fn in phases:
+                        progress.update(task, description=f"[cyan]{label}[/]")
+                        try:
+                            fn()
+                        except Exception as exc:
+                            self.ui.error(f"{label} failed: {exc}")
+                            self.logger.exception("Phase %s failed", label)
+                            self._save_state()
+                            if not Confirm.ask(
+                                "Continue with remaining phases?",
+                                default=True,
+                            ):
+                                break
+                        progress.advance(task)
+
+            # ── Phase 6: Verification & Report ────────────────────
+            self.ui.phase_header(6, 7, "Verification & Report")
+            report_file = self.report.save_report()
+            self.report.report["report_file"] = report_file
+            rollback_file = self.report.save_rollback_script()
+            self.ui.show_final_report(
+                self.report.report, self.config.portainer_edition
+            )
+            if rollback_file:
+                self.ui.info(f"Rollback script: {rollback_file}")
+
+            # Check if all phases completed
+            all_done = all(
+                status == "completed"
+                for status in self.state.get("phases", {}).values()
+            )
+            if all_done:
+                # Clean up checkpoint file
+                if os.path.isfile(self.config.checkpoint_file):
+                    os.remove(self.config.checkpoint_file)
+                self.ui.success("Migration completed!")
+            else:
+                self.ui.warning(
+                    "Some phases incomplete. Run with --resume to continue."
+                )
+
+        except KeyboardInterrupt:
+            self._save_state()
+            self.ui.warning(
+                "Migration interrupted. Run with --resume to continue."
+            )
+        except Exception as exc:
+            self.logger.exception("Unhandled error in migration engine")
+            self.ui.error(f"Migration failed: {exc}")
+            self._save_state()
+
 
 # ---------------------------------------------------------------------------
 # CLI helpers
@@ -2766,39 +3095,35 @@ def setup_logging(config: Config) -> logging.Logger:
 
 if __name__ == "__main__":
     args = parse_args()
-
     config = Config()
+    config.detect_platform()
+
     if args.dry_run:
         config.dry_run = True
     if args.export_only:
         config.strategy = "export"
-
-    config.detect_platform()
-
-    # Determine log file name
-    config.log_file = f"migration_{config.platform_name}.log"
+    if args.config:
+        try:
+            with open(args.config, "r", encoding="utf-8") as f:
+                cfg_data = json.load(f)
+            for key, value in cfg_data.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+        except Exception as e:
+            console.print(f"[red]Error loading config: {e}[/]")
+            sys.exit(1)
 
     logger = setup_logging(config)
+    logger.info(f"Migration tool v{__version__} starting on {config.platform_name}")
 
-    # Banner
-    banner_text = Text()
-    banner_text.append("Portainer ", style="bold cyan")
-    banner_text.append("-> ", style="bold white")
-    banner_text.append("Arcane ", style="bold green")
-    banner_text.append("Migration Tool", style="bold white")
-    banner_text.append(f"\nv{__version__}", style="dim")
-    banner_text.append(f"  |  Platform: {config.platform_name}", style="dim")
-    banner_text.append(f"  |  Docker: {'yes' if config.has_docker else 'no'}", style="dim")
-    if config.dry_run:
-        banner_text.append("\n[DRY RUN MODE]", style="bold yellow")
-
-    console.print(
-        Panel(
-            banner_text,
-            title="migrate.py",
-            border_style="bright_blue",
-            padding=(1, 2),
-        )
-    )
-
-    logger.info("Migration tool initialized on %s", config.platform_name)
+    try:
+        engine = MigrationEngine(config, logger)
+        engine.run(args=args)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Migration interrupted. Run with --resume to continue.[/]")
+        sys.exit(130)
+    except Exception as e:
+        logger.exception("Unhandled error")
+        console.print(f"\n[red]Fatal error: {e}[/]")
+        console.print(f"[dim]Check log file for details[/]")
+        sys.exit(1)
