@@ -1284,6 +1284,602 @@ class ReportGenerator:
 
 
 # ---------------------------------------------------------------------------
+# MigrationEngine
+# ---------------------------------------------------------------------------
+
+
+class MigrationEngine:
+    """Orchestrates the full migration with checkpoint/resume and CE/EE branching."""
+
+    PHASES = [
+        "portainer_backup", "registries", "git_repos", "networks", "volumes",
+        "stacks", "gitops_syncs", "containers", "templates", "users",
+        "webhooks", "ee_rbac_export", "ee_audit_export",
+    ]
+
+    REGISTRY_TYPE_MAP = {
+        1: "custom", 2: "custom", 3: "custom", 4: "custom",
+        5: "custom", 6: "dockerhub", 7: "ecr", 8: "custom",
+    }
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.portainer = PortainerClient(config, logger)
+        self.arcane = ArcaneClient(config, logger)
+        self.docker = DockerLocal(config, logger)
+        self.ui = WizardUI(config, logger)
+        self.report = ReportGenerator(config, logger)
+        self.state = self._load_state()
+        self.discovery: Dict[str, Any] = {}
+        self._git_repo_map: Dict[str, str] = {}  # stack_id -> arcane_repo_id
+
+    # ------------------------------------------------------------------
+    # Task 7: Checkpoint & State Management
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> dict:
+        """Load from checkpoint file if exists and config_hash matches.
+
+        Otherwise return fresh state with all phases pending.
+        """
+        cp = self.config.checkpoint_file
+        if os.path.isfile(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as fh:
+                    saved = json.load(fh)
+                if saved.get("config_hash") == self.config.config_hash():
+                    self.logger.info(
+                        "Resuming from checkpoint: %s", cp
+                    )
+                    return saved
+                self.logger.warning(
+                    "Checkpoint config_hash mismatch -- starting fresh"
+                )
+            except (json.JSONDecodeError, OSError) as exc:
+                self.logger.warning("Could not load checkpoint: %s", exc)
+
+        # Fresh state
+        return {
+            "config_hash": self.config.config_hash(),
+            "phases": {phase: "pending" for phase in self.PHASES},
+            "migrated_items": {phase: [] for phase in self.PHASES},
+        }
+
+    def _save_state(self):
+        """Write state to checkpoint file as JSON."""
+        try:
+            with open(self.config.checkpoint_file, "w", encoding="utf-8") as fh:
+                json.dump(self.state, fh, indent=2, default=str)
+        except OSError as exc:
+            self.logger.warning("Could not save checkpoint: %s", exc)
+
+    def _phase_status(self, phase: str) -> str:
+        """Return status of a phase from state."""
+        return self.state.get("phases", {}).get(phase, "pending")
+
+    def _mark_phase(self, phase: str, status: str):
+        """Update phase status and save."""
+        self.state.setdefault("phases", {})[phase] = status
+        self._save_state()
+
+    def _is_migrated(self, phase: str, item_id: str) -> bool:
+        """Check if item already migrated (for resume)."""
+        migrated = self.state.get("migrated_items", {}).get(phase, [])
+        return str(item_id) in migrated
+
+    def _record_migrated(self, phase: str, item_id: str):
+        """Add item to migrated list and save."""
+        self.state.setdefault("migrated_items", {}).setdefault(phase, [])
+        item_str = str(item_id)
+        if item_str not in self.state["migrated_items"][phase]:
+            self.state["migrated_items"][phase].append(item_str)
+        self._save_state()
+
+    def _should_include(self, resource_type: str) -> bool:
+        """Check if resource type is in user's scope selection.
+
+        An empty ``selected_items`` dict means nothing was selected (exclude all).
+        If the key is present, the resource type is included.  An empty list
+        value for the key means *all items* of that type are selected.
+        """
+        return resource_type in self.config.selected_items
+
+    def _is_ee(self) -> bool:
+        """Shorthand for Enterprise Edition check."""
+        return self.config.portainer_edition == "EE"
+
+    def _execute_or_log(
+        self,
+        action: str,
+        api_call: Callable,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Dry-run wrapper: if dry_run, log and return stub; else call api_call."""
+        if self.config.dry_run:
+            self.ui.dry_run_msg(action)
+            self.logger.debug("[DRY RUN] %s args=%s kwargs=%s", action, args, kwargs)
+            return {"dry_run": True, "action": action}
+        return api_call(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Task 8: Discovery Phase
+    # ------------------------------------------------------------------
+
+    def discover(self) -> dict:
+        """Enumerate all Portainer resources. Returns discovery dict."""
+        self.ui.phase_header(2, 7, "Discovery & Audit")
+        discovery: Dict[str, Any] = {}
+
+        # Count items to discover: 8 for CE, 12 for EE
+        total_items = 12 if self._is_ee() else 8
+
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Discovering resources...", total=total_items)
+
+            # --- CE + EE resources ---
+
+            # Stacks: classify as file-based vs git-based
+            stacks = self.portainer.list_stacks()
+            compose_stacks = [s for s in stacks if s.get("Type") == 2]
+            git_stacks = [s for s in compose_stacks if s.get("GitConfig")]
+            file_stacks = [s for s in compose_stacks if not s.get("GitConfig")]
+            discovery["Stacks"] = {
+                "count": len(compose_stacks),
+                "details": f"{len(file_stacks)} file-based, {len(git_stacks)} git-based",
+                "edition": "CE + EE",
+                "data": compose_stacks,
+            }
+            progress.advance(task)
+
+            # Containers: separate standalone from compose-managed
+            containers = self.portainer.list_containers(all=True)
+            standalone = [
+                c for c in containers
+                if not c.get("Labels", {}).get("com.docker.compose.project")
+            ]
+            compose_count = len(containers) - len(standalone)
+            discovery["Standalone Containers"] = {
+                "count": len(standalone),
+                "details": f"({compose_count} compose-managed excluded)",
+                "edition": "CE + EE",
+                "data": standalone,
+            }
+            progress.advance(task)
+
+            # Images
+            images = self.portainer.list_images()
+            total_size = sum(img.get("Size", 0) for img in images)
+            size_gb = total_size / (1024**3)
+            discovery["Images"] = {
+                "count": len(images),
+                "details": f"{size_gb:.1f} GB total",
+                "edition": "CE + EE",
+                "data": images,
+            }
+            progress.advance(task)
+
+            # Volumes
+            vol_data = self.portainer.list_volumes()
+            volumes = vol_data.get("Volumes", []) or []
+            discovery["Volumes"] = {
+                "count": len(volumes),
+                "details": "",
+                "edition": "CE + EE",
+                "data": volumes,
+            }
+            progress.advance(task)
+
+            # Networks: filter out defaults
+            networks = self.portainer.list_networks()
+            default_nets = {"bridge", "host", "none", "ingress", "docker_gwbridge"}
+            user_networks = [
+                n for n in networks if n.get("Name") not in default_nets
+            ]
+            discovery["Networks"] = {
+                "count": len(user_networks),
+                "details": f"({len(networks) - len(user_networks)} default excluded)",
+                "edition": "CE + EE",
+                "data": user_networks,
+            }
+            progress.advance(task)
+
+            # Registries
+            registries = self.portainer.list_registries()
+            discovery["Registries"] = {
+                "count": len(registries),
+                "details": ", ".join(
+                    r.get("Name", "")[:20] for r in registries[:3]
+                ),
+                "edition": "CE + EE",
+                "data": registries,
+            }
+            progress.advance(task)
+
+            # Custom Templates
+            templates = self.portainer.list_custom_templates()
+            discovery["Custom Templates"] = {
+                "count": len(templates),
+                "details": ", ".join(
+                    t.get("Title", "")[:20] for t in templates[:3]
+                ),
+                "edition": "CE + EE",
+                "data": templates,
+            }
+            progress.advance(task)
+
+            # Users
+            users = self.portainer.list_users()
+            discovery["Users"] = {
+                "count": len(users),
+                "details": ", ".join(u.get("Username", "") for u in users[:4]),
+                "edition": "CE + EE",
+                "data": users,
+            }
+            progress.advance(task)
+
+            # --- EE-only resources ---
+            if self._is_ee():
+                webhooks = self.portainer.list_webhooks()
+                discovery["Webhooks"] = {
+                    "count": len(webhooks),
+                    "details": "",
+                    "edition": "EE",
+                    "data": webhooks,
+                }
+                progress.advance(task)
+
+                teams = self.portainer.list_teams()
+                discovery["Teams"] = {
+                    "count": len(teams),
+                    "details": ", ".join(
+                        t.get("Name", "") for t in teams[:3]
+                    ),
+                    "edition": "EE",
+                    "data": teams,
+                }
+                progress.advance(task)
+
+                roles = self.portainer.list_roles()
+                discovery["Roles"] = {
+                    "count": len(roles),
+                    "details": "",
+                    "edition": "EE",
+                    "data": roles,
+                }
+                progress.advance(task)
+
+                edge_stacks = self.portainer.list_edge_stacks()
+                discovery["Edge Stacks"] = {
+                    "count": len(edge_stacks),
+                    "details": "(detected)" if edge_stacks else "(none)",
+                    "edition": "EE",
+                    "data": edge_stacks,
+                }
+                progress.advance(task)
+            else:
+                # CE: attempt webhooks gracefully
+                webhooks = self.portainer.list_webhooks()
+                if webhooks:
+                    discovery["Webhooks"] = {
+                        "count": len(webhooks),
+                        "details": "",
+                        "edition": "CE",
+                        "data": webhooks,
+                    }
+
+            # Settings (always export as reference)
+            settings = self.portainer.get_settings()
+            discovery["Settings"] = {
+                "count": 1,
+                "details": "Exported for reference",
+                "edition": "CE + EE",
+                "data": settings,
+            }
+
+        self.discovery = discovery
+        self.ui.show_discovery_summary(discovery, self.config.portainer_edition)
+        return discovery
+
+    # ------------------------------------------------------------------
+    # Task 9: Data Transformation Helpers
+    # ------------------------------------------------------------------
+
+    def _transform_registry(self, reg: dict) -> dict:
+        """Map Portainer registry to Arcane CreateContainerRegistryRequest.
+
+        Handles ECR special case (awsAccessKeyId, awsSecretAccessKey, awsRegion).
+        """
+        port_type = reg.get("Type", 1)
+        registry_type = self.REGISTRY_TYPE_MAP.get(port_type, "custom")
+
+        result: Dict[str, Any] = {
+            "url": reg.get("URL", ""),
+            "username": reg.get("Username", ""),
+            "token": reg.get("Password", ""),
+            "description": reg.get("Name", ""),
+            "insecure": False,
+            "enabled": True,
+            "registryType": registry_type,
+        }
+
+        # ECR special case
+        if registry_type == "ecr":
+            ecr = reg.get("Ecr", {}) or {}
+            result["awsAccessKeyId"] = ecr.get("AccessKeyID", "")
+            result["awsSecretAccessKey"] = ecr.get("SecretAccessKey", "")
+            result["awsRegion"] = ecr.get("Region", "")
+
+        return result
+
+    def _transform_stack_to_project(self, stack: dict, compose_content: str) -> dict:
+        """Convert Portainer stack to Arcane project payload.
+
+        Converts stack.Env array [{name, value}] to envContent string (KEY=VALUE lines).
+        """
+        env_vars = stack.get("Env", []) or []
+        env_lines = [
+            f"{v.get('name', '')}={v.get('value', '')}"
+            for v in env_vars
+            if v.get("name")
+        ]
+        env_content = "\n".join(env_lines)
+
+        return {
+            "name": stack.get("Name", ""),
+            "composeContent": compose_content,
+            "envContent": env_content,
+        }
+
+    def _transform_git_stack_to_gitops(self, stack: dict, repo_id: str) -> dict:
+        """Convert a git-based stack to an Arcane GitOps sync payload.
+
+        Extracts GitConfig: branch (strips ``refs/heads/``), composePath,
+        autoSync, syncInterval.
+        """
+        git_cfg = stack.get("GitConfig", {}) or {}
+        branch = git_cfg.get("ReferenceName", "main")
+        # Strip refs/heads/ prefix if present
+        if branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/"):]
+
+        auto_update = stack.get("AutoUpdate", {}) or {}
+        auto_sync = bool(auto_update.get("Interval"))
+        # Default sync interval: 5 minutes (300s) if auto-sync is on
+        sync_interval = auto_update.get("Interval", 300) if auto_sync else 0
+
+        return {
+            "name": stack.get("Name", ""),
+            "repositoryId": repo_id,
+            "branch": branch,
+            "composePath": git_cfg.get("ComposeFilePathInRepository", "docker-compose.yml"),
+            "autoSync": auto_sync,
+            "syncInterval": sync_interval,
+        }
+
+    def _transform_git_config_to_repo(self, stack: dict) -> dict:
+        """Extract git repository info from a git-based stack.
+
+        Returns payload for Arcane ``create_git_repo``.
+        """
+        git_cfg = stack.get("GitConfig", {}) or {}
+        auth = git_cfg.get("Authentication", {}) or {}
+
+        # Determine auth type
+        has_token = bool(auth.get("Password") or auth.get("Token"))
+        has_username = bool(auth.get("Username"))
+        auth_type = "token" if (has_token or has_username) else "none"
+
+        return {
+            "name": f"repo-{stack.get('Name', 'unknown')}",
+            "url": git_cfg.get("URL", ""),
+            "authType": auth_type,
+            "token": auth.get("Password", "") or auth.get("Token", ""),
+            "username": auth.get("Username", ""),
+            "enabled": True,
+        }
+
+    def _transform_network(self, net: dict) -> dict:
+        """Map a Portainer/Docker network to Arcane network create payload.
+
+        Preserves driver, IPAM config, labels, and options.
+        """
+        ipam_cfg = net.get("IPAM", {}) or {}
+        ipam_config_list = ipam_cfg.get("Config", []) or []
+
+        # Build IPAM section
+        ipam: Dict[str, Any] = {}
+        if ipam_cfg.get("Driver"):
+            ipam["driver"] = ipam_cfg["Driver"]
+        if ipam_config_list:
+            ipam["config"] = []
+            for subnet_cfg in ipam_config_list:
+                entry: Dict[str, str] = {}
+                if subnet_cfg.get("Subnet"):
+                    entry["subnet"] = subnet_cfg["Subnet"]
+                if subnet_cfg.get("Gateway"):
+                    entry["gateway"] = subnet_cfg["Gateway"]
+                if subnet_cfg.get("IPRange"):
+                    entry["ipRange"] = subnet_cfg["IPRange"]
+                if entry:
+                    ipam["config"].append(entry)
+        if ipam_cfg.get("Options"):
+            ipam["options"] = ipam_cfg["Options"]
+
+        options: Dict[str, Any] = {
+            "driver": net.get("Driver", "bridge"),
+            "internal": net.get("Internal", False),
+            "attachable": net.get("Attachable", False),
+            "enableIPv6": net.get("EnableIPv6", False),
+            "labels": net.get("Labels", {}) or {},
+            "options": net.get("Options", {}) or {},
+        }
+        if ipam:
+            options["ipam"] = ipam
+
+        return {
+            "name": net.get("Name", ""),
+            "options": options,
+        }
+
+    def _transform_container(self, inspect_data: dict) -> dict:
+        """FULL FIDELITY transform of Docker inspect data to Arcane ContainerCreate schema.
+
+        Parses Config, HostConfig, Mounts, NetworkSettings from the inspect payload.
+        Every field matters -- uses ``or []`` for nullable list fields to avoid None issues.
+        """
+        config = inspect_data.get("Config", {}) or {}
+        host_config = inspect_data.get("HostConfig", {}) or {}
+        mounts_raw = inspect_data.get("Mounts", []) or []
+        network_settings = inspect_data.get("NetworkSettings", {}) or {}
+
+        # --- Port bindings ---
+        port_bindings_raw = host_config.get("PortBindings", {}) or {}
+        port_bindings: Dict[str, Any] = {}
+        for container_port, host_list in port_bindings_raw.items():
+            # container_port is like "80/tcp"
+            port_bindings[container_port] = [
+                {
+                    "HostIp": binding.get("HostIp", ""),
+                    "HostPort": binding.get("HostPort", ""),
+                }
+                for binding in (host_list or [])
+            ]
+
+        # --- Mounts: preserve Source:Destination:Mode ---
+        binds = host_config.get("Binds", []) or []
+        mounts: List[Dict[str, Any]] = []
+        for mount in mounts_raw:
+            mount_entry: Dict[str, Any] = {
+                "Type": mount.get("Type", "volume"),
+                "Source": mount.get("Source", ""),
+                "Destination": mount.get("Destination", ""),
+                "Mode": mount.get("Mode", ""),
+                "RW": mount.get("RW", True),
+            }
+            if mount.get("Driver"):
+                mount_entry["Driver"] = mount["Driver"]
+            mounts.append(mount_entry)
+
+        # --- Restart policy ---
+        restart_policy = host_config.get("RestartPolicy", {}) or {}
+
+        # --- Healthcheck ---
+        healthcheck_raw = config.get("Healthcheck", {}) or {}
+        healthcheck: Dict[str, Any] = {}
+        if healthcheck_raw:
+            healthcheck = {
+                "Test": healthcheck_raw.get("Test", []) or [],
+                "Interval": healthcheck_raw.get("Interval", 0),
+                "Timeout": healthcheck_raw.get("Timeout", 0),
+                "Retries": healthcheck_raw.get("Retries", 0),
+                "StartPeriod": healthcheck_raw.get("StartPeriod", 0),
+            }
+
+        # --- Devices ---
+        devices_raw = host_config.get("Devices", []) or []
+        devices = [
+            {
+                "PathOnHost": d.get("PathOnHost", ""),
+                "PathInContainer": d.get("PathInContainer", ""),
+                "CgroupPermissions": d.get("CgroupPermissions", "rwm"),
+            }
+            for d in devices_raw
+        ]
+
+        # --- DNS ---
+        dns = host_config.get("Dns", []) or []
+        dns_search = host_config.get("DnsSearch", []) or []
+        dns_options = host_config.get("DnsOptions", []) or []
+
+        # --- Exposed ports ---
+        exposed_ports = config.get("ExposedPorts", {}) or {}
+
+        # --- Build the result ---
+        result: Dict[str, Any] = {
+            # From Config
+            "Image": config.get("Image", ""),
+            "Env": config.get("Env", []) or [],
+            "Cmd": config.get("Cmd", []) or [],
+            "Entrypoint": config.get("Entrypoint", []) or [],
+            "Labels": config.get("Labels", {}) or {},
+            "Hostname": config.get("Hostname", ""),
+            "Domainname": config.get("Domainname", ""),
+            "User": config.get("User", ""),
+            "WorkingDir": config.get("WorkingDir", ""),
+            "Tty": config.get("Tty", False),
+            "OpenStdin": config.get("OpenStdin", False),
+            "ExposedPorts": exposed_ports,
+            # HostConfig
+            "HostConfig": {
+                "NetworkMode": host_config.get("NetworkMode", "default"),
+                "PortBindings": port_bindings,
+                "Binds": binds,
+                "Memory": host_config.get("Memory", 0),
+                "MemorySwap": host_config.get("MemorySwap", 0),
+                "NanoCpus": host_config.get("NanoCpus", 0),
+                "CpuShares": host_config.get("CpuShares", 0),
+                "Privileged": host_config.get("Privileged", False),
+                "CapAdd": host_config.get("CapAdd", []) or [],
+                "CapDrop": host_config.get("CapDrop", []) or [],
+                "SecurityOpt": host_config.get("SecurityOpt", []) or [],
+                "ReadonlyRootfs": host_config.get("ReadonlyRootfs", False),
+                "Devices": devices,
+                "PidsLimit": host_config.get("PidsLimit", 0),
+                "AutoRemove": host_config.get("AutoRemove", False),
+                "Dns": dns,
+                "DnsSearch": dns_search,
+                "DnsOptions": dns_options,
+                "RestartPolicy": {
+                    "Name": restart_policy.get("Name", ""),
+                    "MaximumRetryCount": restart_policy.get("MaximumRetryCount", 0),
+                },
+            },
+            "Mounts": mounts,
+        }
+
+        # Add Healthcheck only if present
+        if healthcheck:
+            result["Healthcheck"] = healthcheck
+
+        # Attach container name (strip leading /)
+        name = inspect_data.get("Name", "")
+        if name.startswith("/"):
+            name = name[1:]
+        result["name"] = name
+
+        return result
+
+    def _transform_custom_template(self, template: dict, file_content: str) -> dict:
+        """Convert Portainer custom template to Arcane template payload."""
+        return {
+            "name": template.get("Title", ""),
+            "description": template.get("Description", ""),
+            "content": file_content,
+            "envContent": "",
+        }
+
+    def _transform_user(self, user: dict) -> dict:
+        """Map Portainer user to Arcane user create payload.
+
+        Role mapping: 1 = admin, 2 = user.
+        Passwords cannot be migrated -- uses a default placeholder.
+        """
+        role = user.get("Role", 2)
+        if role == 1:
+            roles = ["admin"]
+        else:
+            roles = ["user"]
+
+        return {
+            "username": user.get("Username", ""),
+            "password": "ChangeMe123!",
+            "roles": roles,
+        }
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 
