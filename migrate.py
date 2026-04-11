@@ -85,6 +85,7 @@ import logging  # noqa: E402
 import platform  # noqa: E402
 import shutil  # noqa: E402
 from dataclasses import dataclass, field, asdict  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
 from typing import Optional, List, Dict, Any, Callable  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -630,6 +631,656 @@ class DockerLocal:
             return [cid.strip() for cid in result.stdout.strip().splitlines() if cid.strip()]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return []
+
+
+# ---------------------------------------------------------------------------
+# WizardUI
+# ---------------------------------------------------------------------------
+
+
+class WizardUI:
+    """Terminal-based wizard interface using rich for all console output."""
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.console = console  # global Console instance
+
+    # -- Banner & phase helpers --------------------------------------------
+
+    def banner(self):
+        """Display welcome banner with version, platform info."""
+        banner_text = Text()
+        banner_text.append("Portainer ", style="bold cyan")
+        banner_text.append("-> ", style="bold white")
+        banner_text.append("Arcane ", style="bold green")
+        banner_text.append("Migration Tool", style="bold white")
+        banner_text.append(f"\nv{__version__}", style="dim")
+        banner_text.append(
+            f"  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim"
+        )
+        banner_text.append(f"  |  Platform: {self.config.platform_name}", style="dim")
+        banner_text.append(
+            f"  |  Docker: {'[green]available[/green]' if self.config.has_docker else '[yellow]not found[/yellow]'}",
+            style="dim",
+        )
+        if self.config.log_file:
+            banner_text.append(f"\nLog file: {self.config.log_file}", style="dim")
+        if self.config.dry_run:
+            banner_text.append("\n[DRY RUN MODE]", style="bold yellow")
+
+        self.console.print(
+            Panel(
+                banner_text,
+                title="[cyan]migrate.py[/cyan]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
+
+    def phase_header(self, phase_num, total: int, title: str):
+        """Display phase separator. phase_num can be int or string like '1.5'."""
+        self.console.print()
+        self.console.rule(
+            f"[bold blue]Phase {phase_num} of {total}: {title}[/bold blue]"
+        )
+        self.console.print()
+
+    # -- Message helpers ---------------------------------------------------
+
+    def success(self, msg: str):
+        """Green checkmark prefix."""
+        self.console.print(f"  [green]\u2714[/green] {msg}")
+
+    def warning(self, msg: str):
+        """Yellow triangle prefix."""
+        self.console.print(f"  [yellow]\u26a0[/yellow] {msg}")
+
+    def error(self, msg: str):
+        """Red cross prefix."""
+        self.console.print(f"  [red]\u2718[/red] {msg}")
+
+    def info(self, msg: str):
+        """Blue info prefix."""
+        self.console.print(f"  [blue]\u2139[/blue] {msg}")
+
+    def dry_run_msg(self, msg: str):
+        """Display a dry-run notice."""
+        self.console.print(f"  [yellow][DRY RUN][/yellow] Would {msg}")
+
+    # -- Edition panel -----------------------------------------------------
+
+    def show_edition_panel(self, edition: str, version: str):
+        """Show CE or EE panel after connection."""
+        if edition == "EE":
+            lines = [
+                f"[bold]Portainer Business Edition {version}[/bold]\n",
+                "[green]\u2714[/green] Webhooks available for migration",
+                "[green]\u2714[/green] RBAC export available",
+                "[green]\u2714[/green] Activity logs can be exported",
+                "[green]\u2714[/green] Edge device detection enabled",
+            ]
+            self.console.print(
+                Panel(
+                    "\n".join(lines),
+                    title="[green]Enterprise Edition Detected[/green]",
+                    border_style="green",
+                )
+            )
+        else:
+            lines = [
+                f"[bold]Portainer Community Edition {version}[/bold]\n",
+                "[yellow]\u26a0[/yellow] Webhooks may not be available",
+                "[yellow]\u26a0[/yellow] Teams and roles are not available",
+                "[yellow]\u26a0[/yellow] Activity logs are not available",
+                "",
+                "[blue]\u2139[/blue] All core resources (stacks, containers, volumes, networks, registries, users) fully supported",
+            ]
+            self.console.print(
+                Panel(
+                    "\n".join(lines),
+                    title="[cyan]Community Edition Detected[/cyan]",
+                    border_style="cyan",
+                )
+            )
+
+    # -- Connection prompts ------------------------------------------------
+
+    def ask_portainer_connection(self):
+        """Prompt for Portainer URL, API key, SSL verify. Store in config."""
+        self.console.print("\n[bold cyan]Portainer Connection[/bold cyan]")
+        self.config.portainer_url = Prompt.ask(
+            "  [blue]Portainer URL[/blue]",
+            default="https://portainer.example.com:9443",
+        )
+        self.config.portainer_api_key = Prompt.ask(
+            "  [blue]API Key[/blue]", password=True
+        )
+        self.config.portainer_ssl_verify = Confirm.ask(
+            "  [blue]Verify SSL certificate?[/blue]", default=True
+        )
+
+    def ask_arcane_connection(self):
+        """Prompt for Arcane URL, auth method, credentials. Store in config."""
+        self.console.print("\n[bold cyan]Arcane Connection[/bold cyan]")
+        self.config.arcane_url = Prompt.ask(
+            "  [blue]Arcane URL[/blue]",
+            default="https://arcane.example.com",
+        )
+        auth_method = Prompt.ask(
+            "  [blue]Auth method[/blue]",
+            choices=["apikey", "login"],
+            default="apikey",
+        )
+        if auth_method == "apikey":
+            self.config.arcane_api_key = Prompt.ask(
+                "  [blue]API Key[/blue]", password=True
+            )
+        else:
+            self.config.arcane_username = Prompt.ask(
+                "  [blue]Username[/blue]", default="admin"
+            )
+            self.config.arcane_password = Prompt.ask(
+                "  [blue]Password[/blue]", password=True
+            )
+
+    # -- Selection prompts -------------------------------------------------
+
+    def select_endpoint(self, endpoints: list) -> int:
+        """Show numbered table of Portainer endpoints. Return endpoint ID."""
+        if len(endpoints) == 1:
+            ep = endpoints[0]
+            self.info(
+                f"Auto-selected endpoint: [bold]{ep.get('Name', 'unknown')}[/bold] (ID {ep['Id']})"
+            )
+            return ep["Id"]
+
+        table = Table(title="Portainer Endpoints", box=box.ROUNDED)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="bold")
+        table.add_column("URL", style="dim")
+        table.add_column("Status", style="green")
+
+        for idx, ep in enumerate(endpoints, 1):
+            status = "[green]Up[/green]" if ep.get("Status") == 1 else "[red]Down[/red]"
+            table.add_row(
+                str(idx),
+                str(ep.get("Id", "")),
+                ep.get("Name", ""),
+                ep.get("URL", ""),
+                status,
+            )
+
+        self.console.print(table)
+        choice = IntPrompt.ask(
+            "  [blue]Select endpoint #[/blue]", default=1
+        )
+        selected = endpoints[max(0, min(choice - 1, len(endpoints) - 1))]
+        return selected["Id"]
+
+    def select_arcane_environment(self, environments: list) -> str:
+        """Show numbered table of Arcane environments. Return environment ID."""
+        if len(environments) == 1:
+            env = environments[0]
+            env_id = str(env.get("id", env.get("Id", "")))
+            self.info(
+                f"Auto-selected environment: [bold]{env.get('name', env.get('Name', 'unknown'))}[/bold] (ID {env_id})"
+            )
+            return env_id
+
+        table = Table(title="Arcane Environments", box=box.ROUNDED)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="bold")
+        table.add_column("Status", style="green")
+
+        for idx, env in enumerate(environments, 1):
+            env_id = str(env.get("id", env.get("Id", "")))
+            env_name = env.get("name", env.get("Name", ""))
+            env_status = env.get("status", env.get("Status", "unknown"))
+            table.add_row(str(idx), env_id, env_name, str(env_status))
+
+        self.console.print(table)
+        choice = IntPrompt.ask(
+            "  [blue]Select environment #[/blue]", default=1
+        )
+        selected = environments[max(0, min(choice - 1, len(environments) - 1))]
+        return str(selected.get("id", selected.get("Id", "")))
+
+    # -- Discovery summary -------------------------------------------------
+
+    def show_discovery_summary(self, discovery: dict, edition: str):
+        """Show resource table and NOT migrated table."""
+        # -- Discovered resources table --
+        table = Table(title="Discovered Resources", box=box.ROUNDED)
+        table.add_column("Resource", style="bold")
+        table.add_column("Count", justify="right", style="cyan")
+        table.add_column("Details", style="dim")
+        table.add_column("Edition", style="dim")
+
+        # Core resources (always shown)
+        core_types = [
+            "stacks", "containers", "volumes", "networks",
+            "registries", "users", "custom_templates", "settings",
+        ]
+        for rtype in core_types:
+            data = discovery.get(rtype, {})
+            count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+            details = data.get("details", "") if isinstance(data, dict) else ""
+            table.add_row(rtype.replace("_", " ").title(), str(count), str(details), "CE+EE")
+
+        # EE-only resources
+        if edition == "EE":
+            ee_types = [
+                "webhooks", "teams", "team_memberships", "roles",
+                "resource_controls", "edge_stacks",
+            ]
+            for rtype in ee_types:
+                data = discovery.get(rtype, {})
+                count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+                details = data.get("details", "") if isinstance(data, dict) else ""
+                table.add_row(rtype.replace("_", " ").title(), str(count), str(details), "EE only")
+
+        self.console.print(table)
+
+        # -- NOT migrated table --
+        not_migrated = Table(title="NOT Migrated (reference only)", box=box.ROUNDED)
+        not_migrated.add_column("Resource", style="yellow")
+        not_migrated.add_column("Reason", style="dim")
+        not_migrated.add_column("Edition", style="dim")
+
+        not_migrated.add_row("Endpoint Groups", "No equivalent in Arcane", "CE+EE")
+        not_migrated.add_row("SSL Certificates", "Managed differently in Arcane", "CE+EE")
+
+        if edition == "EE":
+            ee_not_migrated = [
+                ("Teams & Memberships", "EE RBAC -- exported for reference"),
+                ("Granular Roles", "EE RBAC -- exported for reference"),
+                ("Resource ACLs", "EE RBAC -- exported for reference"),
+                ("Edge Groups/Jobs/Stacks", "Edge compute -- exported for reference"),
+                ("Activity Logs", "Audit data -- exported for reference"),
+            ]
+            for name, reason in ee_not_migrated:
+                not_migrated.add_row(name, reason, "EE only")
+
+        self.console.print(not_migrated)
+
+    # -- Strategy & scope --------------------------------------------------
+
+    def ask_strategy(self):
+        """Prompt: export/live, dry-run toggle, backup dir. Store in config."""
+        self.console.print("\n[bold cyan]Migration Strategy[/bold cyan]")
+        self.config.strategy = Prompt.ask(
+            "  [blue]Strategy[/blue] (export = files only, live = export + import)",
+            choices=["export", "live"],
+            default=self.config.strategy,
+        )
+        self.config.dry_run = Confirm.ask(
+            "  [blue]Enable dry-run mode?[/blue] (simulate without changes)",
+            default=self.config.dry_run,
+        )
+        self.config.backup_dir = Prompt.ask(
+            "  [blue]Backup / export directory[/blue]",
+            default=self.config.backup_dir,
+        )
+
+    def ask_scope_confirmation(self, discovery: dict, edition: str) -> bool:
+        """Ask 'Migrate ALL?' If no, show per-type selection. Return True if any selected."""
+        migrate_all = Confirm.ask(
+            "\n  [blue]Migrate ALL discovered resources?[/blue]", default=True
+        )
+
+        core_types = [
+            "stacks", "containers", "volumes", "networks",
+            "registries", "users", "custom_templates", "settings",
+        ]
+        ee_types = [
+            "webhooks", "teams", "team_memberships", "roles",
+            "resource_controls", "edge_stacks",
+        ]
+
+        if migrate_all:
+            self.config.selected_items = {
+                rt: [] for rt in core_types
+            }
+            if edition == "EE":
+                for rt in ee_types:
+                    self.config.selected_items[rt] = []
+            return True
+
+        # Per-type selection
+        self.config.selected_items = {}
+
+        self.console.print("\n  [bold]Core resources:[/bold]")
+        for rt in core_types:
+            data = discovery.get(rt, {})
+            count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+            if count > 0 and Confirm.ask(
+                f"    [blue]Migrate {rt.replace('_', ' ')}?[/blue] ({count} found)",
+                default=True,
+            ):
+                self.config.selected_items[rt] = []
+
+        if edition == "EE":
+            self.console.print("\n  [bold]EE-only resources:[/bold]")
+            for rt in ee_types:
+                data = discovery.get(rt, {})
+                count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+                if count > 0 and Confirm.ask(
+                    f"    [blue]Migrate {rt.replace('_', ' ')}?[/blue] ({count} found)",
+                    default=True,
+                ):
+                    self.config.selected_items[rt] = []
+
+        return bool(self.config.selected_items)
+
+    # -- Preflight ---------------------------------------------------------
+
+    def show_preflight_results(self, results: list) -> bool:
+        """Show preflight table. If any FAIL, ask continue? Return bool."""
+        table = Table(title="Preflight Checks", box=box.ROUNDED)
+        table.add_column("Check", style="bold")
+        table.add_column("Result", justify="center")
+        table.add_column("Details", style="dim")
+
+        has_fail = False
+        for r in results:
+            status = r.get("status", "PASS")
+            if status == "PASS":
+                styled_status = "[green]PASS[/green]"
+            elif status == "WARN":
+                styled_status = "[yellow]WARN[/yellow]"
+            else:
+                styled_status = "[red]FAIL[/red]"
+                has_fail = True
+            table.add_row(r.get("check", ""), styled_status, r.get("details", ""))
+
+        self.console.print(table)
+
+        if has_fail:
+            return Confirm.ask(
+                "  [yellow]Some checks failed. Continue anyway?[/yellow]",
+                default=False,
+            )
+        return True
+
+    # -- Migration plan ----------------------------------------------------
+
+    def show_migration_plan(self, config: Config):
+        """Show Panel with migration plan details."""
+        lines = [
+            f"[bold]Strategy:[/bold]       {config.strategy}",
+            f"[bold]Dry run:[/bold]        {'[yellow]Yes[/yellow]' if config.dry_run else '[green]No[/green]'}",
+            f"[bold]Backup dir:[/bold]     [dim]{config.backup_dir}[/dim]",
+            f"[bold]Docker local:[/bold]   {'[green]available[/green]' if config.has_docker else '[yellow]not available[/yellow]'}",
+            "",
+            "[bold]Execution order:[/bold]",
+        ]
+
+        execution_order = [
+            "1. Registries",
+            "2. Networks",
+            "3. Volumes (with backup if docker available)",
+            "4. Stacks / Compose projects",
+            "5. Standalone containers",
+            "6. Custom templates",
+            "7. Users",
+            "8. Webhooks (EE or if available)",
+            "9. Settings",
+        ]
+        for step in execution_order:
+            lines.append(f"  {step}")
+
+        self.console.print(
+            Panel(
+                "\n".join(lines),
+                title="[cyan]Migration Plan[/cyan]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
+
+    # -- Progress ----------------------------------------------------------
+
+    def create_progress(self) -> Progress:
+        """Return configured Progress with spinner + text + bar + percentage."""
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=self.console,
+        )
+
+    # -- Final report ------------------------------------------------------
+
+    def show_final_report(self, report: dict, edition: str):
+        """Show final migration report with summary, errors, and action items."""
+        self.console.print()
+        self.console.rule("[bold cyan]Migration Report[/bold cyan]")
+        self.console.print()
+
+        # 1. Summary table
+        summary = Table(title="Migration Summary", box=box.ROUNDED)
+        summary.add_column("Resource", style="bold")
+        summary.add_column("Migrated", justify="right", style="green")
+        summary.add_column("Failed", justify="right", style="red")
+        summary.add_column("Skipped", justify="right", style="yellow")
+        summary.add_column("Edition", style="dim")
+
+        resources = report.get("resources", {})
+        for rtype, data in resources.items():
+            ed = "EE only" if rtype in (
+                "webhooks", "teams", "team_memberships", "roles",
+                "resource_controls", "edge_stacks",
+            ) else "CE+EE"
+            summary.add_row(
+                rtype.replace("_", " ").title(),
+                str(data.get("migrated", 0)),
+                str(data.get("failed", 0)),
+                str(data.get("skipped", 0)),
+                ed,
+            )
+
+        self.console.print(summary)
+
+        # 2. EE Reference Exports table
+        ee_ref = report.get("ee_reference", {})
+        if edition == "EE" and ee_ref:
+            self.console.print()
+            ee_table = Table(title="EE Reference Exports", box=box.ROUNDED)
+            ee_table.add_column("Resource", style="bold")
+            ee_table.add_column("Count", justify="right", style="cyan")
+            ee_table.add_column("File", style="dim")
+
+            for rtype, data in ee_ref.items():
+                ee_table.add_row(
+                    rtype.replace("_", " ").title(),
+                    str(data.get("count", 0)),
+                    data.get("file_path", ""),
+                )
+
+            self.console.print(ee_table)
+
+        # 3. Errors list
+        errors = report.get("errors", [])
+        if errors:
+            self.console.print()
+            self.console.print("[bold red]Errors:[/bold red]")
+            for err in errors:
+                self.console.print(
+                    f"  [red]\u2718[/red] [{err.get('resource_type', '')}] "
+                    f"{err.get('name', '')}: {err.get('error', '')}"
+                )
+
+        # 4. Action items
+        action_items = report.get("action_items", [])
+        if not action_items:
+            # Provide sensible defaults
+            action_items = []
+        # Always suggest common post-migration steps
+        default_actions = [
+            "Reset user passwords in Arcane (passwords cannot be migrated)",
+            "Manually map webhooks if URLs differ between systems",
+            "Review RBAC / role assignments in Arcane",
+            "Review and adjust environment settings in Arcane",
+        ]
+        all_actions = list(action_items) + [
+            a for a in default_actions if a not in action_items
+        ]
+
+        if all_actions:
+            self.console.print()
+            self.console.print("[bold yellow]Action Items:[/bold yellow]")
+            for item in all_actions:
+                self.console.print(f"  [yellow]\u26a0[/yellow] {item}")
+
+        # 5. File paths
+        config = report.get("config", {})
+        backup_dir = config.get("backup_dir", "./migration_export")
+        self.console.print()
+        self.console.print("[bold cyan]Output Files:[/bold cyan]")
+        file_paths = [
+            ("Report", f"{backup_dir}/migration_report.json"),
+            ("Rollback script", f"{backup_dir}/rollback.sh"),
+            ("Log", config.get("log_file", "")),
+            ("Backup directory", backup_dir),
+        ]
+        if edition == "EE":
+            file_paths.append(("EE reference", f"{backup_dir}/ee_reference/"))
+
+        for label, path in file_paths:
+            if path:
+                self.console.print(f"  [dim]{label}:[/dim] {path}")
+
+        self.console.print()
+
+
+# ---------------------------------------------------------------------------
+# ReportGenerator
+# ---------------------------------------------------------------------------
+
+
+class ReportGenerator:
+    """Tracks migration results and generates output files."""
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.report: Dict[str, Any] = {
+            "version": __version__,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "portainer_edition": config.portainer_edition,
+            "config": config.to_dict(),
+            "resources": {},
+            "ee_reference": {},
+            "errors": [],
+            "action_items": [],
+            "completed_at": None,
+        }
+        self.rollback_commands: List[Dict[str, str]] = []
+
+    def _ensure_resource(self, resource_type: str):
+        """Ensure the resource_type key exists in the report resources dict."""
+        if resource_type not in self.report["resources"]:
+            self.report["resources"][resource_type] = {
+                "migrated": 0,
+                "failed": 0,
+                "skipped": 0,
+                "items": [],
+            }
+
+    def record_success(self, resource_type: str, name: str, source_id: Any, target_id: Any):
+        """Track a successful migration."""
+        self._ensure_resource(resource_type)
+        self.report["resources"][resource_type]["migrated"] += 1
+        self.report["resources"][resource_type]["items"].append({
+            "name": name,
+            "source_id": source_id,
+            "target_id": target_id,
+            "status": "migrated",
+        })
+        self.logger.info("Migrated %s: %s (source=%s -> target=%s)", resource_type, name, source_id, target_id)
+
+    def record_failure(self, resource_type: str, name: str, error: str):
+        """Track a failed migration."""
+        self._ensure_resource(resource_type)
+        self.report["resources"][resource_type]["failed"] += 1
+        self.report["errors"].append({
+            "resource_type": resource_type,
+            "name": name,
+            "error": str(error),
+        })
+        self.logger.error("Failed %s: %s -- %s", resource_type, name, error)
+
+    def record_skip(self, resource_type: str, name: str, reason: str):
+        """Track a skipped resource."""
+        self._ensure_resource(resource_type)
+        self.report["resources"][resource_type]["skipped"] += 1
+        self.logger.info("Skipped %s: %s -- %s", resource_type, name, reason)
+
+    def record_ee_export(self, resource_type: str, count: int, file_path: str):
+        """Track an EE-only reference export."""
+        self.report["ee_reference"][resource_type] = {
+            "count": count,
+            "file_path": file_path,
+        }
+        self.logger.info("EE export %s: %d items -> %s", resource_type, count, file_path)
+
+    def add_action_item(self, message: str):
+        """Append a post-migration action item."""
+        self.report["action_items"].append(message)
+
+    def add_rollback(self, method: str, url: str, description: str):
+        """Append a rollback command."""
+        self.rollback_commands.append({
+            "method": method,
+            "url": url,
+            "description": description,
+        })
+
+    def save_report(self) -> str:
+        """Save JSON report to migration_export/migration_report.json. Return file path."""
+        self.report["completed_at"] = datetime.now(timezone.utc).isoformat()
+        report_dir = self.config.backup_dir
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, "migration_report.json")
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(self.report, fh, indent=2, default=str)
+        self.logger.info("Migration report saved to %s", report_path)
+        return report_path
+
+    def save_rollback_script(self) -> Optional[str]:
+        """Generate rollback.sh with curl commands (reversed order). Return path or None."""
+        if not self.rollback_commands:
+            return None
+
+        report_dir = self.config.backup_dir
+        os.makedirs(report_dir, exist_ok=True)
+        script_path = os.path.join(report_dir, "rollback.sh")
+
+        lines = [
+            "#!/usr/bin/env bash",
+            "# Rollback script -- generated by migrate.py",
+            f"# Generated: {datetime.now(timezone.utc).isoformat()}",
+            "# Review carefully before executing!",
+            "",
+            'set -euo pipefail',
+            "",
+        ]
+
+        for cmd in reversed(self.rollback_commands):
+            lines.append(f"# {cmd['description']}")
+            lines.append(f"curl -X {cmd['method']} \"{cmd['url']}\"")
+            lines.append("")
+
+        with open(script_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+
+        os.chmod(script_path, 0o755)
+        self.logger.info("Rollback script saved to %s", script_path)
+        return script_path
 
 
 # ---------------------------------------------------------------------------
