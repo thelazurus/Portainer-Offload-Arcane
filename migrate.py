@@ -11,7 +11,7 @@ Usage:
 See --help for full option list.
 """
 
-__version__ = "1.0.0"
+__version__ = "0.1.0"
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap -- runs before any third-party imports
