@@ -86,6 +86,7 @@ import platform  # noqa: E402
 import shutil  # noqa: E402
 from dataclasses import dataclass, field, asdict  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
+from pathlib import Path  # noqa: E402
 from typing import Optional, List, Dict, Any, Callable  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -1877,6 +1878,810 @@ class MigrationEngine:
             "password": "ChangeMe123!",
             "roles": roles,
         }
+
+    # ------------------------------------------------------------------
+    # Task 10: Export to Disk
+    # ------------------------------------------------------------------
+
+    def _export_to_disk(self):
+        """Save all discovered Portainer data to the export directory.
+
+        Called before any live migration writes.  Respects ``config.dry_run``
+        (no files written) and ``_should_include()`` (user scope selection).
+        """
+        base = Path(self.config.backup_dir)
+        manifest: Dict[str, Any] = {
+            "tool_version": __version__,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "portainer_edition": self.config.portainer_edition,
+            "portainer_version": self.config.portainer_version,
+            "counts": {},
+        }
+
+        def _write_json(filepath: Path, data: Any):
+            """Write *data* as JSON unless dry-run."""
+            if self.config.dry_run:
+                self.ui.dry_run_msg(f"Write {filepath}")
+                return
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, default=str)
+
+        def _write_text(filepath: Path, text: str):
+            """Write plain text unless dry-run."""
+            if self.config.dry_run:
+                self.ui.dry_run_msg(f"Write {filepath}")
+                return
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        # ---- Registries ----
+        if self._should_include("Registries"):
+            registries = self.discovery.get("Registries", {}).get("data", [])
+            masked = []
+            for r in registries:
+                entry = dict(r)
+                if "Password" in entry:
+                    entry["Password"] = "***MASKED***"
+                masked.append(entry)
+            _write_json(base / "registries" / "registries.json", masked)
+            manifest["counts"]["registries"] = len(masked)
+            self.ui.success(f"Exported {len(masked)} registries")
+
+        # ---- Stacks ----
+        if self._should_include("Stacks"):
+            stacks = self.discovery.get("Stacks", {}).get("data", [])
+            for stack in stacks:
+                name = stack.get("Name", f"stack_{stack.get('Id', 'unknown')}")
+                stack_dir = base / "stacks" / name
+                # Compose file
+                try:
+                    file_resp = self.portainer.get_stack_file(stack["Id"])
+                    compose_content = file_resp.get("StackFileContent", "")
+                except Exception:
+                    compose_content = ""
+                _write_text(stack_dir / "docker-compose.yml", compose_content)
+                # .env
+                env_vars = stack.get("Env", []) or []
+                env_lines = [
+                    f"{v.get('name', '')}={v.get('value', '')}"
+                    for v in env_vars if v.get("name")
+                ]
+                _write_text(stack_dir / ".env", "\n".join(env_lines) + "\n" if env_lines else "")
+                # metadata
+                _write_json(stack_dir / "metadata.json", stack)
+            manifest["counts"]["stacks"] = len(stacks)
+            self.ui.success(f"Exported {len(stacks)} stacks")
+
+        # ---- Standalone Containers ----
+        if self._should_include("Standalone Containers"):
+            containers = self.discovery.get("Standalone Containers", {}).get("data", [])
+            inspected = []
+            for c in containers:
+                cid = c.get("Id", "")
+                try:
+                    inspect_data = self.portainer.inspect_container(cid)
+                    inspected.append(inspect_data)
+                except Exception as exc:
+                    self.logger.warning("Could not inspect container %s: %s", cid, exc)
+                    inspected.append(c)
+            _write_json(base / "containers" / "standalone.json", inspected)
+            manifest["counts"]["standalone_containers"] = len(inspected)
+            self.ui.success(f"Exported {len(inspected)} standalone containers")
+
+        # ---- Networks ----
+        if self._should_include("Networks"):
+            networks = self.discovery.get("Networks", {}).get("data", [])
+            _write_json(base / "networks" / "networks.json", networks)
+            manifest["counts"]["networks"] = len(networks)
+            self.ui.success(f"Exported {len(networks)} networks")
+
+        # ---- Volumes ----
+        if self._should_include("Volumes"):
+            volumes = self.discovery.get("Volumes", {}).get("data", [])
+            _write_json(base / "volumes" / "volumes.json", volumes)
+            manifest["counts"]["volumes"] = len(volumes)
+            # Backup volume data if Docker is available
+            if self.config.has_docker and self.docker.is_available():
+                backup_path = base / "volumes" / "backups"
+                with self.ui.create_progress() as progress:
+                    task = progress.add_task("Backing up volumes...", total=len(volumes))
+                    for vol in volumes:
+                        vol_name = vol.get("Name", "")
+                        if vol_name and not self.config.dry_run:
+                            self.docker.backup_volume(vol_name, str(backup_path))
+                        elif self.config.dry_run:
+                            self.ui.dry_run_msg(f"Backup volume {vol_name}")
+                        progress.advance(task)
+                self.ui.success(f"Exported {len(volumes)} volumes (with backups)")
+            else:
+                self.ui.info(f"Exported {len(volumes)} volumes (metadata only -- no Docker)")
+
+        # ---- Custom Templates ----
+        if self._should_include("Custom Templates"):
+            templates = self.discovery.get("Custom Templates", {}).get("data", [])
+            enriched = []
+            for t in templates:
+                entry = dict(t)
+                try:
+                    file_resp = self.portainer.get_custom_template_file(t["Id"])
+                    entry["FileContent"] = file_resp.get("FileContent", "")
+                except Exception:
+                    entry["FileContent"] = ""
+                enriched.append(entry)
+            _write_json(base / "templates" / "custom_templates.json", enriched)
+            manifest["counts"]["custom_templates"] = len(enriched)
+            self.ui.success(f"Exported {len(enriched)} custom templates")
+
+        # ---- Users ----
+        if self._should_include("Users"):
+            users = self.discovery.get("Users", {}).get("data", [])
+            cleaned = []
+            for u in users:
+                entry = dict(u)
+                entry.pop("Password", None)
+                cleaned.append(entry)
+            _write_json(base / "users" / "users.json", cleaned)
+            manifest["counts"]["users"] = len(cleaned)
+            self.ui.success(f"Exported {len(cleaned)} users")
+
+        # ---- Webhooks ----
+        if self._should_include("Webhooks"):
+            webhooks = self.discovery.get("Webhooks", {}).get("data", [])
+            _write_json(base / "webhooks" / "webhooks.json", webhooks)
+            manifest["counts"]["webhooks"] = len(webhooks)
+            self.ui.success(f"Exported {len(webhooks)} webhooks")
+
+        # ---- Settings ----
+        if self._should_include("Settings"):
+            settings = self.discovery.get("Settings", {}).get("data", {})
+
+            def _mask_settings(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    masked = {}
+                    for k, v in obj.items():
+                        if isinstance(k, str) and any(
+                            s in k.lower() for s in ("password", "secret")
+                        ):
+                            masked[k] = "***MASKED***"
+                        else:
+                            masked[k] = _mask_settings(v)
+                    return masked
+                if isinstance(obj, list):
+                    return [_mask_settings(item) for item in obj]
+                return obj
+
+            _write_json(base / "settings" / "portainer_settings.json", _mask_settings(settings))
+            manifest["counts"]["settings"] = 1
+            self.ui.success("Exported Portainer settings")
+
+        # ---- EE Reference Exports ----
+        if self._is_ee():
+            ee_dir = base / "ee_reference"
+
+            teams = self.discovery.get("Teams", {}).get("data", [])
+            _write_json(ee_dir / "teams.json", teams)
+            manifest["counts"]["teams"] = len(teams)
+            self.ui.info(f"EE reference: {len(teams)} teams")
+
+            try:
+                memberships = self.portainer.list_team_memberships()
+            except Exception:
+                memberships = []
+            _write_json(ee_dir / "team_memberships.json", memberships)
+            manifest["counts"]["team_memberships"] = len(memberships)
+            self.ui.info(f"EE reference: {len(memberships)} team memberships")
+
+            roles = self.discovery.get("Roles", {}).get("data", [])
+            _write_json(ee_dir / "roles.json", roles)
+            manifest["counts"]["roles"] = len(roles)
+            self.ui.info(f"EE reference: {len(roles)} roles")
+
+            try:
+                resource_controls = self.portainer.list_resource_controls()
+            except Exception:
+                resource_controls = []
+            _write_json(ee_dir / "resource_controls.json", resource_controls)
+            manifest["counts"]["resource_controls"] = len(resource_controls)
+            self.ui.info(f"EE reference: {len(resource_controls)} resource controls")
+
+            edge_stacks = self.discovery.get("Edge Stacks", {}).get("data", [])
+            if edge_stacks:
+                _write_json(ee_dir / "edge_stacks.json", edge_stacks)
+                manifest["counts"]["edge_stacks"] = len(edge_stacks)
+                self.ui.info(f"EE reference: {len(edge_stacks)} edge stacks")
+
+        # ---- Manifest ----
+        _write_json(base / "manifest.json", manifest)
+        self.ui.success("Export manifest saved")
+
+    # ------------------------------------------------------------------
+    # Task 11: Live Migration Phases
+    # ------------------------------------------------------------------
+
+    def _portainer_backup(self):
+        """Create a Portainer server backup (tar.gz)."""
+        phase = "portainer_backup"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Portainer backup already completed -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+
+        password = Prompt.ask(
+            "[bold]Backup encryption password[/bold] (blank for none)",
+            password=True,
+            default="",
+        )
+
+        if self.config.dry_run:
+            self.ui.dry_run_msg("Portainer backup")
+            self._mark_phase(phase, "completed")
+            return
+
+        try:
+            backup_bytes = self.portainer.trigger_backup(password)
+            backup_dir = Path(self.config.backup_dir) / "portainer_backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / "portainer_backup.tar.gz"
+            with open(backup_path, "wb") as fh:
+                fh.write(backup_bytes)
+
+            size = backup_path.stat().st_size
+            if size < 100:
+                self.ui.warning(
+                    f"Portainer backup is suspiciously small ({size} bytes)"
+                )
+            else:
+                self.ui.success(f"Portainer backup saved ({size:,} bytes)")
+            self._mark_phase(phase, "completed")
+        except http_requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in (401, 403):
+                self.ui.warning(
+                    "Portainer backup failed (permission denied) -- not fatal"
+                )
+                self.logger.warning("Backup permission error: %s", exc)
+                self._mark_phase(phase, "completed")
+            else:
+                self.ui.error(f"Portainer backup failed: {exc}")
+                self.logger.error("Backup error: %s", exc)
+                self._mark_phase(phase, "failed")
+        except Exception as exc:
+            self.ui.error(f"Portainer backup failed: {exc}")
+            self.logger.error("Backup error: %s", exc)
+            self._mark_phase(phase, "failed")
+
+    def _migrate_registries(self):
+        """Migrate container registries from Portainer to Arcane."""
+        phase = "registries"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Registries already migrated -- skipping")
+            return
+        if not self._should_include("Registries"):
+            self.ui.info("Registries not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        registries = self.discovery.get("Registries", {}).get("data", [])
+
+        for reg in registries:
+            reg_id = str(reg.get("Id", ""))
+            name = reg.get("Name", reg_id)
+            if self._is_migrated(phase, reg_id):
+                self.report.record_skip("Registries", name, "already migrated")
+                continue
+            try:
+                payload = self._transform_registry(reg)
+                result = self._execute_or_log(
+                    f"Create registry '{name}'",
+                    self.arcane.create_registry,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self.report.record_success("Registries", name, reg_id, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/container-registries/{target_id}",
+                    f"Delete registry '{name}'",
+                )
+                self._record_migrated(phase, reg_id)
+            except Exception as exc:
+                self.logger.error("Failed to migrate registry %s: %s", name, exc)
+                self.report.record_failure("Registries", name, str(exc))
+                self.ui.error(f"Registry '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_git_repos(self):
+        """Migrate git repository configs from git-based stacks."""
+        phase = "git_repos"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Git repos already migrated -- skipping")
+            return
+        if not self._should_include("Stacks"):
+            self.ui.info("Stacks not selected -- skipping git repos")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        git_stacks = [s for s in stacks if s.get("GitConfig")]
+
+        for stack in git_stacks:
+            stack_id = str(stack.get("Id", ""))
+            name = stack.get("Name", stack_id)
+            if self._is_migrated(phase, stack_id):
+                self.report.record_skip("Git Repos", name, "already migrated")
+                continue
+            try:
+                payload = self._transform_git_config_to_repo(stack)
+                result = self._execute_or_log(
+                    f"Create git repo for '{name}'",
+                    self.arcane.create_git_repo,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self._git_repo_map[stack_id] = str(target_id)
+                self.report.record_success("Git Repos", name, stack_id, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/customize/git-repositories/{target_id}",
+                    f"Delete git repo for '{name}'",
+                )
+                self._record_migrated(phase, stack_id)
+            except Exception as exc:
+                self.logger.error("Failed to migrate git repo for %s: %s", name, exc)
+                self.report.record_failure("Git Repos", name, str(exc))
+                self.ui.error(f"Git repo for '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_networks(self):
+        """Migrate user-defined networks to Arcane."""
+        phase = "networks"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Networks already migrated -- skipping")
+            return
+        if not self._should_include("Networks"):
+            self.ui.info("Networks not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        eid = self.config.arcane_environment_id
+        networks = self.discovery.get("Networks", {}).get("data", [])
+
+        for net in networks:
+            net_id = net.get("Id", "")
+            name = net.get("Name", net_id)
+            if self._is_migrated(phase, net_id):
+                self.report.record_skip("Networks", name, "already migrated")
+                continue
+            try:
+                payload = self._transform_network(net)
+                result = self._execute_or_log(
+                    f"Create network '{name}'",
+                    self.arcane.create_network,
+                    eid,
+                    payload,
+                )
+                target_id = result.get("Id", "") if isinstance(result, dict) else ""
+                self.report.record_success("Networks", name, net_id, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/environments/{eid}/networks/{target_id}",
+                    f"Delete network '{name}'",
+                )
+                self._record_migrated(phase, net_id)
+            except Exception as exc:
+                self.logger.error("Failed to migrate network %s: %s", name, exc)
+                self.report.record_failure("Networks", name, str(exc))
+                self.ui.error(f"Network '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_volumes(self):
+        """Migrate volumes and optionally restore volume backups."""
+        phase = "volumes"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Volumes already migrated -- skipping")
+            return
+        if not self._should_include("Volumes"):
+            self.ui.info("Volumes not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        eid = self.config.arcane_environment_id
+        volumes = self.discovery.get("Volumes", {}).get("data", [])
+
+        for vol in volumes:
+            name = vol.get("Name", "")
+            if self._is_migrated(phase, name):
+                self.report.record_skip("Volumes", name, "already migrated")
+                continue
+            try:
+                payload = {
+                    "name": name,
+                    "driver": vol.get("Driver", "local"),
+                    "labels": vol.get("Labels", {}) or {},
+                }
+                result = self._execute_or_log(
+                    f"Create volume '{name}'",
+                    self.arcane.create_volume,
+                    eid,
+                    payload,
+                )
+                target_id = name  # volumes are identified by name
+                self.report.record_success("Volumes", name, name, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/environments/{eid}/volumes/{name}",
+                    f"Delete volume '{name}'",
+                )
+                # Upload backup if it exists
+                backup_file = (
+                    Path(self.config.backup_dir) / "volumes" / "backups" / f"{name}.tar.gz"
+                )
+                if backup_file.is_file() and not self.config.dry_run:
+                    try:
+                        self.arcane.upload_volume_backup(eid, name, str(backup_file))
+                        self.ui.success(f"Volume '{name}' backup restored")
+                    except Exception as upload_exc:
+                        self.ui.warning(f"Volume '{name}' backup upload failed: {upload_exc}")
+                self._record_migrated(phase, name)
+            except Exception as exc:
+                self.logger.error("Failed to migrate volume %s: %s", name, exc)
+                self.report.record_failure("Volumes", name, str(exc))
+                self.ui.error(f"Volume '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_stacks(self):
+        """Migrate file-based stacks as Arcane projects."""
+        phase = "stacks"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Stacks already migrated -- skipping")
+            return
+        if not self._should_include("Stacks"):
+            self.ui.info("Stacks not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        eid = self.config.arcane_environment_id
+        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        file_stacks = [s for s in stacks if not s.get("GitConfig")]
+
+        for stack in file_stacks:
+            stack_id = str(stack.get("Id", ""))
+            name = stack.get("Name", stack_id)
+            if self._is_migrated(phase, stack_id):
+                self.report.record_skip("Stacks", name, "already migrated")
+                continue
+            try:
+                file_resp = self.portainer.get_stack_file(stack["Id"])
+                compose_content = file_resp.get("StackFileContent", "")
+                payload = self._transform_stack_to_project(stack, compose_content)
+                result = self._execute_or_log(
+                    f"Create project '{name}'",
+                    self.arcane.create_project,
+                    eid,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self.report.record_success("Stacks", name, stack_id, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/environments/{eid}/projects/{target_id}/destroy",
+                    f"Destroy project '{name}'",
+                )
+                self._record_migrated(phase, stack_id)
+            except Exception as exc:
+                self.logger.error("Failed to migrate stack %s: %s", name, exc)
+                self.report.record_failure("Stacks", name, str(exc))
+                self.ui.error(f"Stack '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_gitops_syncs(self):
+        """Create GitOps syncs for git-based stacks."""
+        phase = "gitops_syncs"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("GitOps syncs already migrated -- skipping")
+            return
+        if not self._should_include("Stacks"):
+            self.ui.info("Stacks not selected -- skipping GitOps syncs")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        eid = self.config.arcane_environment_id
+        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        git_stacks = [s for s in stacks if s.get("GitConfig")]
+
+        for stack in git_stacks:
+            stack_id = str(stack.get("Id", ""))
+            name = stack.get("Name", stack_id)
+            if self._is_migrated(phase, stack_id):
+                self.report.record_skip("GitOps Syncs", name, "already migrated")
+                continue
+            repo_id = self._git_repo_map.get(stack_id)
+            if not repo_id:
+                self.report.record_skip(
+                    "GitOps Syncs", name, "no matching git repo migrated"
+                )
+                self.ui.warning(f"GitOps sync for '{name}' skipped -- no repo mapping")
+                continue
+            try:
+                payload = self._transform_git_stack_to_gitops(stack, repo_id)
+                result = self._execute_or_log(
+                    f"Create GitOps sync '{name}'",
+                    self.arcane.create_gitops_sync,
+                    eid,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self.report.record_success("GitOps Syncs", name, stack_id, target_id)
+                self._record_migrated(phase, stack_id)
+            except Exception as exc:
+                self.logger.error("Failed to create GitOps sync for %s: %s", name, exc)
+                self.report.record_failure("GitOps Syncs", name, str(exc))
+                self.ui.error(f"GitOps sync for '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_containers(self):
+        """Migrate standalone containers to Arcane."""
+        phase = "containers"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Containers already migrated -- skipping")
+            return
+        if not self._should_include("Standalone Containers"):
+            self.ui.info("Containers not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        eid = self.config.arcane_environment_id
+        containers = self.discovery.get("Standalone Containers", {}).get("data", [])
+
+        for c in containers:
+            cid = c.get("Id", "")
+            # Use first name (strip leading /) or fall back to short id
+            names = c.get("Names", [])
+            name = names[0].lstrip("/") if names else cid[:12]
+            if self._is_migrated(phase, cid):
+                self.report.record_skip("Containers", name, "already migrated")
+                continue
+            try:
+                inspect_data = self.portainer.inspect_container(cid)
+                payload = self._transform_container(inspect_data)
+                result = self._execute_or_log(
+                    f"Create container '{name}'",
+                    self.arcane.create_container,
+                    eid,
+                    payload,
+                )
+                target_id = result.get("Id", result.get("id", "")) if isinstance(result, dict) else ""
+                self.report.record_success("Containers", name, cid, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/environments/{eid}/containers/{target_id}?force=true",
+                    f"Delete container '{name}'",
+                )
+                # Start the container if it was running
+                state = inspect_data.get("State", {})
+                was_running = (
+                    state.get("Status", "").lower() == "running"
+                    if isinstance(state, dict)
+                    else False
+                )
+                if was_running and target_id and not self.config.dry_run:
+                    try:
+                        self.arcane.start_container(eid, target_id)
+                        self.ui.info(f"Started container '{name}'")
+                    except Exception as start_exc:
+                        self.ui.warning(f"Could not start container '{name}': {start_exc}")
+                self._record_migrated(phase, cid)
+            except Exception as exc:
+                self.logger.error("Failed to migrate container %s: %s", name, exc)
+                self.report.record_failure("Containers", name, str(exc))
+                self.ui.error(f"Container '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_templates(self):
+        """Migrate custom templates to Arcane."""
+        phase = "templates"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Templates already migrated -- skipping")
+            return
+        if not self._should_include("Custom Templates"):
+            self.ui.info("Custom Templates not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        templates = self.discovery.get("Custom Templates", {}).get("data", [])
+
+        for t in templates:
+            tid = str(t.get("Id", ""))
+            name = t.get("Title", tid)
+            if self._is_migrated(phase, tid):
+                self.report.record_skip("Custom Templates", name, "already migrated")
+                continue
+            try:
+                file_resp = self.portainer.get_custom_template_file(t["Id"])
+                file_content = file_resp.get("FileContent", "")
+                payload = self._transform_custom_template(t, file_content)
+                result = self._execute_or_log(
+                    f"Create template '{name}'",
+                    self.arcane.create_template,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self.report.record_success("Custom Templates", name, tid, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/templates/{target_id}",
+                    f"Delete template '{name}'",
+                )
+                self._record_migrated(phase, tid)
+            except Exception as exc:
+                self.logger.error("Failed to migrate template %s: %s", name, exc)
+                self.report.record_failure("Custom Templates", name, str(exc))
+                self.ui.error(f"Template '{name}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_users(self):
+        """Migrate users to Arcane, skipping duplicates."""
+        phase = "users"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Users already migrated -- skipping")
+            return
+        if not self._should_include("Users"):
+            self.ui.info("Users not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        users = self.discovery.get("Users", {}).get("data", [])
+
+        # Get existing Arcane users to avoid duplicates
+        try:
+            existing = self.arcane.list_users() if not self.config.dry_run else []
+        except Exception:
+            existing = []
+        existing_usernames = {
+            u.get("username", "").lower() for u in existing
+        }
+
+        for user in users:
+            uid = str(user.get("Id", ""))
+            username = user.get("Username", uid)
+            if self._is_migrated(phase, uid):
+                self.report.record_skip("Users", username, "already migrated")
+                continue
+            if username.lower() in existing_usernames:
+                self.report.record_skip("Users", username, "already exists in Arcane")
+                self.ui.info(f"User '{username}' already exists -- skipped")
+                self._record_migrated(phase, uid)
+                continue
+            try:
+                payload = self._transform_user(user)
+                result = self._execute_or_log(
+                    f"Create user '{username}'",
+                    self.arcane.create_user,
+                    payload,
+                )
+                target_id = result.get("id", "") if isinstance(result, dict) else ""
+                self.report.record_success("Users", username, uid, target_id)
+                self.report.add_rollback(
+                    "DELETE",
+                    f"{self.arcane.base_url}/users/{target_id}",
+                    f"Delete user '{username}'",
+                )
+                self.report.add_action_item(
+                    f"User '{username}' was created with default password 'ChangeMe123!' -- must be changed"
+                )
+                self._record_migrated(phase, uid)
+            except Exception as exc:
+                self.logger.error("Failed to migrate user %s: %s", username, exc)
+                self.report.record_failure("Users", username, str(exc))
+                self.ui.error(f"User '{username}' failed: {exc}")
+
+        self._mark_phase(phase, "completed")
+
+    def _migrate_webhooks(self):
+        """Handle webhooks -- requires manual target mapping."""
+        phase = "webhooks"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("Webhooks already handled -- skipping")
+            return
+        if not self._should_include("Webhooks"):
+            self.ui.info("Webhooks not selected -- skipping")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        webhooks = self.discovery.get("Webhooks", {}).get("data", [])
+
+        for wh in webhooks:
+            wh_id = str(wh.get("Id", ""))
+            name = f"webhook-{wh_id}"
+            self.report.record_skip(
+                "Webhooks", name, "needs manual target mapping"
+            )
+            self.ui.warning(
+                f"Webhook '{name}' skipped -- needs manual target mapping"
+            )
+
+        self._mark_phase(phase, "completed")
+
+    def _export_ee_rbac(self):
+        """Export EE RBAC data (teams, memberships, roles, resource controls)."""
+        phase = "ee_rbac_export"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("EE RBAC export already completed -- skipping")
+            return
+        if not self._is_ee():
+            self.ui.info("Not EE edition -- skipping RBAC export")
+            self._mark_phase(phase, "completed")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        base = Path(self.config.backup_dir) / "ee_reference"
+
+        def _write(filename: str, data: Any, label: str):
+            filepath = base / filename
+            if not self.config.dry_run:
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                with open(filepath, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, default=str)
+            else:
+                self.ui.dry_run_msg(f"Write {filepath}")
+            count = len(data) if isinstance(data, list) else 1
+            self.report.record_ee_export(label, count, str(filepath))
+
+        teams = self.discovery.get("Teams", {}).get("data", [])
+        _write("teams.json", teams, "Teams")
+
+        try:
+            memberships = self.portainer.list_team_memberships()
+        except Exception:
+            memberships = []
+        _write("team_memberships.json", memberships, "Team Memberships")
+
+        roles = self.discovery.get("Roles", {}).get("data", [])
+        _write("roles.json", roles, "Roles")
+
+        try:
+            resource_controls = self.portainer.list_resource_controls()
+        except Exception:
+            resource_controls = []
+        _write("resource_controls.json", resource_controls, "Resource Controls")
+
+        self._mark_phase(phase, "completed")
+        self.ui.success("EE RBAC reference exported")
+
+    def _export_ee_audit(self):
+        """Export EE audit/activity logs (optional, version-dependent)."""
+        phase = "ee_audit_export"
+        if self._phase_status(phase) == "completed":
+            self.ui.info("EE audit export already completed -- skipping")
+            return
+        if not self._is_ee():
+            self.ui.info("Not EE edition -- skipping audit export")
+            self._mark_phase(phase, "completed")
+            return
+        if not self._should_include("Activity Logs"):
+            self.ui.info("Activity Logs not selected -- skipping audit export")
+            self._mark_phase(phase, "completed")
+            return
+
+        self._mark_phase(phase, "in_progress")
+        self.report.record_skip(
+            "Activity Logs",
+            "audit_logs",
+            "Audit API varies by EE version -- skipped",
+        )
+        self.ui.info("EE audit export skipped (API varies by EE version)")
+        self._mark_phase(phase, "completed")
 
 
 # ---------------------------------------------------------------------------
