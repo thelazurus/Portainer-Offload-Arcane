@@ -1442,7 +1442,7 @@ class MigrationEngine:
 
     def discover(self) -> dict:
         """Enumerate all Portainer resources. Returns discovery dict."""
-        self.ui.phase_header(2, 7, "Discovery & Audit")
+        self.ui.phase_header(2, 6, "Discovery & Audit")
         discovery: Dict[str, Any] = {}
 
         # Count items to discover: 9 for CE, 13 for EE (includes settings)
@@ -2956,7 +2956,7 @@ class MigrationEngine:
                     self.ui.info("Resuming from checkpoint")
 
             # ── Phase 1: Connection Setup ─────────────────────────
-            self.ui.phase_header("1", 7, "Connection Setup")
+            self.ui.phase_header("1", 6, "Connection Setup")
 
             # Portainer connection
             self.ui.ask_portainer_connection()
@@ -3048,7 +3048,7 @@ class MigrationEngine:
             # ── Phase 1.5: Portainer Backup ───────────────────────
             skip_backup = args and getattr(args, "skip_backup", False)
             if not skip_backup:
-                self.ui.phase_header("1.5", 7, "Portainer Backup")
+                self.ui.phase_header("1.5", 6, "Portainer Backup")
                 do_backup = Confirm.ask(
                     "Create a Portainer backup before proceeding?",
                     default=True,
@@ -3068,7 +3068,7 @@ class MigrationEngine:
             self.discovery = self.discover()
 
             # ── Phase 3: Strategy Selection ───────────────────────
-            self.ui.phase_header(3, 7, "Strategy Selection")
+            self.ui.phase_header(3, 6, "Strategy Selection")
             self.ui.ask_strategy()
 
             # Enforce --export-only regardless of user selection
@@ -3087,13 +3087,13 @@ class MigrationEngine:
 
             # ── Phase 4: Pre-Flight Checks ────────────────────────
             if self.config.strategy == "live":
-                self.ui.phase_header(4, 7, "Pre-Flight Checks")
+                self.ui.phase_header(4, 6, "Pre-Flight Checks")
                 results = self.preflight_checks()
                 if not self.ui.show_preflight_results(results):
                     return
 
             # ── Phase 5: Execution ────────────────────────────────
-            self.ui.phase_header(5, 7, "Execution")
+            self.ui.phase_header(5, 6, "Execution")
 
             # Always export first
             self._export_to_disk()
@@ -3144,7 +3144,7 @@ class MigrationEngine:
                         progress.advance(task)
 
             # ── Phase 6: Verification & Report ────────────────────
-            self.ui.phase_header(6, 7, "Verification & Report")
+            self.ui.phase_header(6, 6, "Verification & Report")
             report_file = self.report.save_report()
             self.report.report["report_file"] = report_file
             rollback_file = self.report.save_rollback_script()

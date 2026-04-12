@@ -107,7 +107,8 @@ run, but no writes are made to Arcane. Shows exactly what would happen.
     "arcane_environment_id": "0",
     "strategy": "live",
     "dry_run": false,
-    "backup_dir": "./migration_export"
+    "backup_dir": "./migration_export",
+    "log_file": "./migration.log"
 }
 ```
 
