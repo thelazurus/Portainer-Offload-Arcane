@@ -6,10 +6,11 @@
     registries, users, and everything in between.
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-0.3.0-blue?style=flat-square" alt="Version">
+    <a href="https://github.com/RandomSynergy17/Portainer-Offload-Arcane/actions/workflows/ci.yml"><img src="https://github.com/RandomSynergy17/Portainer-Offload-Arcane/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/RandomSynergy17/Portainer-Offload-Arcane/releases/latest"><img src="https://img.shields.io/github/v/release/RandomSynergy17/Portainer-Offload-Arcane?style=flat-square&color=blue" alt="Latest Release"></a>
     <img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
     <img src="https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey?style=flat-square" alt="Platform">
-    <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
     <img src="https://img.shields.io/badge/portainer-CE%20%2B%20EE-13BEF9?style=flat-square&logo=portainer&logoColor=white" alt="Portainer CE + EE">
     <img src="https://img.shields.io/badge/target-Arcane-blueviolet?style=flat-square" alt="Arcane">
   </p>
