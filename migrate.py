@@ -402,7 +402,12 @@ class ArcaneClient:
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {}
-        return resp.json()
+        body = resp.json()
+        # Arcane wraps most responses in {"success": bool, "data": ...}.
+        # Unwrap automatically so callers receive the inner payload directly.
+        if isinstance(body, dict) and "data" in body and "success" in body:
+            return body["data"]
+        return body
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return self._request("GET", path, params=params)
@@ -500,7 +505,7 @@ class ArcaneClient:
         with open(filepath, "rb") as fh:
             return self._post(
                 f"/environments/{eid}/volumes/{name}/backups/upload",
-                files={"file": (os.path.basename(filepath), fh, "application/gzip")},
+                files={"file": (Path(filepath).name, fh, "application/gzip")},
             )
 
     # -- Containers --------------------------------------------------------
@@ -565,7 +570,8 @@ class DockerLocal:
 
     def backup_volume(self, name: str, backup_dir: str) -> Optional[str]:
         """Create a tar.gz backup of a Docker volume. Returns filepath or None."""
-        os.makedirs(backup_dir, exist_ok=True)
+        backup_path = Path(backup_dir)
+        backup_path.mkdir(parents=True, exist_ok=True)
         archive_name = f"{name}.tar.gz"
         self.logger.info("Backing up volume %s to %s/%s", name, backup_dir, archive_name)
         try:
@@ -573,7 +579,7 @@ class DockerLocal:
                 [
                     "docker", "run", "--rm",
                     "-v", f"{name}:/source:ro",
-                    "-v", f"{os.path.abspath(backup_dir)}:/backup",
+                    "-v", f"{backup_path.resolve()}:/backup",
                     "alpine",
                     "tar", "czf", f"/backup/{archive_name}", "-C", "/source", ".",
                 ],
@@ -586,7 +592,7 @@ class DockerLocal:
                     "Volume backup failed for %s: %s", name, result.stderr.strip()
                 )
                 return None
-            filepath = os.path.join(backup_dir, archive_name)
+            filepath = str(backup_path / archive_name)
             self.logger.info("Volume %s backed up to %s", name, filepath)
             return filepath
         except subprocess.TimeoutExpired:
@@ -795,10 +801,14 @@ class WizardUI:
             )
 
         self.console.print(table)
-        choice = IntPrompt.ask(
-            "  [blue]Select endpoint #[/blue]", default=1
-        )
-        selected = endpoints[max(0, min(choice - 1, len(endpoints) - 1))]
+        while True:
+            choice = IntPrompt.ask(
+                "  [blue]Select endpoint #[/blue]", default=1
+            )
+            if 1 <= choice <= len(endpoints):
+                break
+            self.warning(f"Please enter a number between 1 and {len(endpoints)}")
+        selected = endpoints[choice - 1]
         return selected["Id"]
 
     def select_arcane_environment(self, environments: list) -> str:
@@ -824,10 +834,14 @@ class WizardUI:
             table.add_row(str(idx), env_id, env_name, str(env_status))
 
         self.console.print(table)
-        choice = IntPrompt.ask(
-            "  [blue]Select environment #[/blue]", default=1
-        )
-        selected = environments[max(0, min(choice - 1, len(environments) - 1))]
+        while True:
+            choice = IntPrompt.ask(
+                "  [blue]Select environment #[/blue]", default=1
+            )
+            if 1 <= choice <= len(environments):
+                break
+            self.warning(f"Please enter a number between 1 and {len(environments)}")
+        selected = environments[choice - 1]
         return str(selected.get("id", selected.get("Id", "")))
 
     # -- Discovery summary -------------------------------------------------
@@ -1229,22 +1243,22 @@ class ReportGenerator:
     def save_report(self) -> str:
         """Save JSON report to migration_export/migration_report.json. Return file path."""
         self.report["completed_at"] = datetime.now(timezone.utc).isoformat()
-        report_dir = self.config.backup_dir
-        os.makedirs(report_dir, exist_ok=True)
-        report_path = os.path.join(report_dir, "migration_report.json")
+        report_dir = Path(self.config.backup_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / "migration_report.json"
         with open(report_path, "w", encoding="utf-8") as fh:
             json.dump(self.report, fh, indent=2, default=str)
         self.logger.info("Migration report saved to %s", report_path)
-        return report_path
+        return str(report_path)
 
     def save_rollback_script(self) -> Optional[str]:
         """Generate rollback.sh with curl commands (reversed order). Return path or None."""
         if not self.rollback_commands:
             return None
 
-        report_dir = self.config.backup_dir
-        os.makedirs(report_dir, exist_ok=True)
-        script_path = os.path.join(report_dir, "rollback.sh")
+        report_dir = Path(self.config.backup_dir)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        script_path = report_dir / "rollback.sh"
 
         api_key = "YOUR_API_KEY_HERE"  # Never embed real credentials in scripts
         lines = [
@@ -1267,9 +1281,9 @@ class ReportGenerator:
         with open(script_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
 
-        os.chmod(script_path, 0o700)  # Owner-only: script contains sensitive URLs
+        script_path.chmod(0o700)  # Owner-only: script contains sensitive URLs
         self.logger.info("Rollback script saved to %s", script_path)
-        return script_path
+        return str(script_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1279,6 +1293,8 @@ class ReportGenerator:
 
 class MigrationEngine:
     """Orchestrates the full migration with checkpoint/resume and CE/EE branching."""
+
+    PHASE_TOTAL = 6
 
     PHASES = [
         "portainer_backup", "registries", "git_repos", "networks", "volumes",
@@ -1381,6 +1397,27 @@ class MigrationEngine:
         """Shorthand for Enterprise Edition check."""
         return self.config.portainer_edition == "EE"
 
+    _SENSITIVE_TERMS = (
+        "password", "secret", "token", "key", "credential", "auth", "cert", "private",
+    )
+
+    @staticmethod
+    def _mask_sensitive_dict(obj: Any) -> Any:
+        """Recursively mask dict values whose keys contain sensitive terms."""
+        if isinstance(obj, dict):
+            masked = {}
+            for k, v in obj.items():
+                if isinstance(k, str) and any(
+                    s in k.lower() for s in MigrationEngine._SENSITIVE_TERMS
+                ):
+                    masked[k] = "***MASKED***"
+                else:
+                    masked[k] = MigrationEngine._mask_sensitive_dict(v)
+            return masked
+        if isinstance(obj, list):
+            return [MigrationEngine._mask_sensitive_dict(item) for item in obj]
+        return obj
+
     def _execute_or_log(
         self,
         action: str,
@@ -1401,7 +1438,7 @@ class MigrationEngine:
 
     def discover(self) -> dict:
         """Enumerate all Portainer resources. Returns discovery dict."""
-        self.ui.phase_header(2, 6, "Discovery & Audit")
+        self.ui.phase_header(2, self.PHASE_TOTAL, "Discovery & Audit")
         discovery: Dict[str, Any] = {}
 
         # Count items to discover: 9 for CE, 13 for EE (includes settings)
@@ -1774,39 +1811,13 @@ class MigrationEngine:
                 for binding in (host_list or [])
             ]
 
-        # --- Mounts: preserve Source:Destination:Mode ---
+        # --- Binds ---
         binds = host_config.get("Binds", []) or []
-        mounts: List[Dict[str, Any]] = []
-        for mount in mounts_raw:
-            mount_entry: Dict[str, Any] = {
-                "type": mount.get("Type", "volume"),
-                "source": mount.get("Source", ""),
-                "destination": mount.get("Destination", ""),
-                "mode": mount.get("Mode", ""),
-                "rw": mount.get("RW", True),
-            }
-            if mount.get("Driver"):
-                mount_entry["driver"] = mount["Driver"]
-            mounts.append(mount_entry)
 
         # --- Restart policy ---
         restart_policy = host_config.get("RestartPolicy", {}) or {}
 
-        # --- Devices ---
-        devices_raw = host_config.get("Devices", []) or []
-        devices = [
-            {
-                "PathOnHost": d.get("PathOnHost", ""),
-                "PathInContainer": d.get("PathInContainer", ""),
-                "CgroupPermissions": d.get("CgroupPermissions", "rwm"),
-            }
-            for d in devices_raw
-        ]
 
-        # --- DNS ---
-        dns = host_config.get("Dns", []) or []
-        dns_search = host_config.get("DnsSearch", []) or []
-        dns_options = host_config.get("DnsOptions", []) or []
 
         # --- Exposed ports ---
         exposed_ports = config.get("ExposedPorts", {}) or {}
@@ -1852,41 +1863,28 @@ class MigrationEngine:
             "tty": config.get("Tty", False),
             "openStdin": config.get("OpenStdin", False),
             "volumes": volume_strings,
-            "mounts": mounts,
             "exposedPorts": exposed_ports,
             "restartPolicy": restart_str,
             "privileged": host_config.get("Privileged", False),
-            # hostConfig
+            # hostConfig -- per ContainerHostConfigCreate schema
             "hostConfig": {
                 "networkMode": host_config.get("NetworkMode", "default"),
                 "portBindings": port_bindings,
+                "binds": binds,
                 "memory": host_config.get("Memory") or 0,
                 "memorySwap": host_config.get("MemorySwap") or 0,
                 "nanoCpus": host_config.get("NanoCpus") or 0,
                 "cpuShares": host_config.get("CpuShares") or 0,
-                "capAdd": host_config.get("CapAdd", []) or [],
-                "capDrop": host_config.get("CapDrop", []) or [],
-                "securityOpt": host_config.get("SecurityOpt", []) or [],
                 "readonlyRootfs": host_config.get("ReadonlyRootfs", False),
-                "devices": devices,
-                "pidsLimit": host_config.get("PidsLimit") or 0,
+                "privileged": host_config.get("Privileged", False),
+                "publishAllPorts": host_config.get("PublishAllPorts", False),
                 "autoRemove": host_config.get("AutoRemove", False),
-                "dns": dns,
-                "dnsSearch": dns_search,
-                "dnsOptions": dns_options,
+                "restartPolicy": {
+                    "name": restart_policy.get("Name", ""),
+                    "maximumRetryCount": restart_policy.get("MaximumRetryCount") or 0,
+                },
             },
         }
-
-        # Add healthcheck only if present (prefer runtime override: H2)
-        healthcheck_raw = host_config.get("Healthcheck") or config.get("Healthcheck")
-        if healthcheck_raw:
-            result["healthcheck"] = {
-                "test": healthcheck_raw.get("Test", []) or [],
-                "interval": healthcheck_raw.get("Interval") or 0,
-                "timeout": healthcheck_raw.get("Timeout") or 0,
-                "retries": healthcheck_raw.get("Retries") or 0,
-                "startPeriod": healthcheck_raw.get("StartPeriod") or 0,
-            }
 
         # Attach container name (strip leading /)
         name = inspect_data.get("Name", "")
@@ -2000,7 +1998,8 @@ class MigrationEngine:
                     f"{v.get('name', '')}={v.get('value', '')}"
                     for v in env_vars if v.get("name")
                 ]
-                _write_text(stack_dir / ".env", "\n".join(env_lines) + "\n" if env_lines else "")
+                if env_lines:
+                    _write_text(stack_dir / ".env", "\n".join(env_lines) + "\n")
                 # metadata
                 _write_json(stack_dir / "metadata.json", stack)
             manifest["counts"]["stacks"] = len(stacks)
@@ -2088,25 +2087,7 @@ class MigrationEngine:
         # ---- Settings ----
         if self._should_include("settings"):
             settings = self.discovery.get("settings", {}).get("data", {})
-
-            SENSITIVE_TERMS = ("password", "secret", "token", "key", "credential", "auth", "cert", "private")
-
-            def _mask_settings(obj: Any) -> Any:
-                if isinstance(obj, dict):
-                    masked = {}
-                    for k, v in obj.items():
-                        if isinstance(k, str) and any(
-                            s in k.lower() for s in SENSITIVE_TERMS
-                        ):
-                            masked[k] = "***MASKED***"
-                        else:
-                            masked[k] = _mask_settings(v)
-                    return masked
-                if isinstance(obj, list):
-                    return [_mask_settings(item) for item in obj]
-                return obj
-
-            _write_json(base / "settings" / "portainer_settings.json", _mask_settings(settings))
+            _write_json(base / "settings" / "portainer_settings.json", self._mask_sensitive_dict(settings))
             manifest["counts"]["settings"] = 1
             self.ui.success("Exported Portainer settings")
 
@@ -2287,6 +2268,8 @@ class MigrationEngine:
                     payload,
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
+                if self.config.dry_run and not target_id:
+                    target_id = f"dry-run-repo-{stack_id}"
                 self._git_repo_map[stack_id] = str(target_id)
                 self.report.record_success("Git Repos", name, stack_id, target_id)
                 if not self.config.dry_run:
@@ -2704,6 +2687,9 @@ class MigrationEngine:
                 f"Webhook '{name}' skipped -- needs manual target mapping"
             )
 
+        if webhooks:
+            self.ui.warning(f"All {len(webhooks)} webhooks require manual migration")
+
         self._mark_phase(phase, "completed")
 
     def _export_ee_rbac(self):
@@ -2915,32 +2901,31 @@ class MigrationEngine:
                     self.ui.info("Resuming from checkpoint")
 
             # ── Phase 1: Connection Setup ─────────────────────────
-            self.ui.phase_header("1", 6, "Connection Setup")
+            self.ui.phase_header("1", self.PHASE_TOTAL, "Connection Setup")
 
-            # Portainer connection
-            self.ui.ask_portainer_connection()
-            self.portainer = PortainerClient(self.config, self.logger)
-
-            try:
-                self.portainer.test_connection()
-                self.ui.success(f"Connected to Portainer at {self.config.portainer_url}")
-            except Exception as exc:
-                self.ui.error(f"Cannot connect to Portainer: {exc}")
-                return
-
-            try:
-                self.portainer.detect_edition()
-                self.ui.show_edition_panel(
-                    self.config.portainer_edition,
-                    self.config.portainer_version,
-                )
-                self.ui.success(
-                    f"Portainer {self.config.portainer_edition} "
-                    f"v{self.config.portainer_version} detected"
-                )
-            except Exception as exc:
-                self.ui.error(f"Cannot detect Portainer edition: {exc}")
-                return
+            # Portainer connection (with retry)
+            for _portainer_attempt in range(3):
+                self.ui.ask_portainer_connection()
+                self.portainer = PortainerClient(self.config, self.logger)
+                try:
+                    self.portainer.test_connection()
+                    self.ui.success(f"Connected to Portainer at {self.config.portainer_url}")
+                    self.portainer.detect_edition()
+                    self.ui.show_edition_panel(
+                        self.config.portainer_edition,
+                        self.config.portainer_version,
+                    )
+                    self.ui.success(
+                        f"Portainer {self.config.portainer_edition} "
+                        f"v{self.config.portainer_version} detected"
+                    )
+                    break
+                except Exception as exc:
+                    self.ui.error(f"Portainer connection failed: {exc}")
+                    if _portainer_attempt == 2:
+                        self.ui.error("Max retries reached. Exiting.")
+                        return
+                    self.ui.info("Please re-enter connection details.")
 
             # Mark EE-only phases as completed on CE so all-done check works
             if not self._is_ee():
@@ -2960,34 +2945,38 @@ class MigrationEngine:
             self.config.portainer_endpoint_id = self.ui.select_endpoint(endpoints)
             self.portainer = PortainerClient(self.config, self.logger)
 
-            # Arcane connection
-            self.ui.ask_arcane_connection()
-            self.arcane = ArcaneClient(self.config, self.logger)
+            # Arcane connection (with retry)
+            for _arcane_attempt in range(3):
+                self.ui.ask_arcane_connection()
+                self.arcane = ArcaneClient(self.config, self.logger)
 
-            if self.config.arcane_username and self.config.arcane_password:
                 try:
-                    self.arcane.login(
-                        self.config.arcane_username,
-                        self.config.arcane_password,
-                    )
-                    self.ui.success("Authenticated with Arcane")
-                except Exception as exc:
-                    self.ui.error(f"Arcane login failed: {exc}")
-                    return
+                    if self.config.arcane_username and self.config.arcane_password:
+                        self.arcane.login(
+                            self.config.arcane_username,
+                            self.config.arcane_password,
+                        )
+                        self.ui.success("Authenticated with Arcane")
 
-            try:
-                version_info = self.arcane.get_version()
-                version_str = (
-                    version_info
-                    if isinstance(version_info, str)
-                    else version_info.get("version", "unknown")
-                    if isinstance(version_info, dict)
-                    else str(version_info)
-                )
-                self.ui.success(f"Connected to Arcane v{version_str}")
-            except Exception as exc:
-                self.ui.error(f"Cannot connect to Arcane: {exc}")
-                return
+                    version_info = self.arcane.get_version()
+                    version_str = (
+                        version_info
+                        if isinstance(version_info, str)
+                        else version_info.get(
+                            "displayVersion",
+                            version_info.get("currentVersion", "unknown"),
+                        )
+                        if isinstance(version_info, dict)
+                        else str(version_info)
+                    )
+                    self.ui.success(f"Connected to Arcane v{version_str}")
+                    break
+                except Exception as exc:
+                    self.ui.error(f"Arcane connection failed: {exc}")
+                    if _arcane_attempt == 2:
+                        self.ui.error("Max retries reached. Exiting.")
+                        return
+                    self.ui.info("Please re-enter connection details.")
 
             # Select Arcane environment
             try:
@@ -3007,7 +2996,7 @@ class MigrationEngine:
             # ── Phase 1.5: Portainer Backup ───────────────────────
             skip_backup = args and getattr(args, "skip_backup", False)
             if not skip_backup:
-                self.ui.phase_header("1.5", 6, "Portainer Backup")
+                self.ui.phase_header("1.5", self.PHASE_TOTAL, "Portainer Backup")
                 do_backup = Confirm.ask(
                     "Create a Portainer backup before proceeding?",
                     default=True,
@@ -3027,7 +3016,7 @@ class MigrationEngine:
             self.discovery = self.discover()
 
             # ── Phase 3: Strategy Selection ───────────────────────
-            self.ui.phase_header(3, 6, "Strategy Selection")
+            self.ui.phase_header(3, self.PHASE_TOTAL, "Strategy Selection")
             self.ui.ask_strategy()
 
             # Enforce --export-only regardless of user selection
@@ -3046,13 +3035,13 @@ class MigrationEngine:
 
             # ── Phase 4: Pre-Flight Checks ────────────────────────
             if self.config.strategy == "live":
-                self.ui.phase_header(4, 6, "Pre-Flight Checks")
+                self.ui.phase_header(4, self.PHASE_TOTAL, "Pre-Flight Checks")
                 results = self.preflight_checks()
                 if not self.ui.show_preflight_results(results):
                     return
 
             # ── Phase 5: Execution ────────────────────────────────
-            self.ui.phase_header(5, 6, "Execution")
+            self.ui.phase_header(5, self.PHASE_TOTAL, "Execution")
 
             # Always export first
             self._export_to_disk()
@@ -3103,7 +3092,7 @@ class MigrationEngine:
                         progress.advance(task)
 
             # ── Phase 6: Verification & Report ────────────────────
-            self.ui.phase_header(6, 6, "Verification & Report")
+            self.ui.phase_header(6, self.PHASE_TOTAL, "Verification & Report")
             report_file = self.report.save_report()
             self.report.report["report_file"] = report_file
             rollback_file = self.report.save_rollback_script()
