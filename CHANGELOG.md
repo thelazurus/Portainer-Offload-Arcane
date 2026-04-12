@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-11
+
+### Added
+- `--import-dir PATH` feature: import from a previously exported migration directory
+  - Skips Portainer connection entirely (no Portainer URL/API key needed)
+  - Reads discovery data from exported JSON files and manifest.json
+  - Reads compose files from disk instead of calling Portainer API
+  - Reads container inspect data from standalone.json instead of Portainer API
+  - Reads custom template content from exported data instead of Portainer API
+  - Forces strategy to "live" (push to Arcane)
+  - Still requires Arcane connection for the target environment
+- `config.import_mode` flag on Config dataclass
+
 ## [0.2.0] - 2026-04-11
 
 ### Added

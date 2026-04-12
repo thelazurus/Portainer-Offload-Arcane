@@ -52,7 +52,7 @@ python migrate.py --dry-run
 # Resume an interrupted migration
 python migrate.py --resume
 
-# Import from a previous export (planned for a future release)
+# Import from a previous export (skips Portainer connection, pushes to Arcane)
 python migrate.py --import-dir ./migration_export
 
 # Load connection config from file
