@@ -473,11 +473,6 @@ class ArcaneClient:
     def create_project(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/projects", json_data=data)
 
-    def deploy_project(
-        self, eid: str, pid: str, options: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        return self._post(f"/environments/{eid}/projects/{pid}/deploy", json_data=options)
-
     # -- GitOps ------------------------------------------------------------
 
     def create_gitops_sync(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -534,24 +529,6 @@ class ArcaneClient:
 
     def create_webhook(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/webhooks", json_data=data)
-
-    # -- Notifications -----------------------------------------------------
-
-    def get_notification_settings(self, eid: str) -> Dict[str, Any]:
-        return self._get(f"/environments/{eid}/notification-settings")
-
-    def create_notification_settings(
-        self, eid: str, data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        return self._post(f"/environments/{eid}/notification-settings", json_data=data)
-
-    # -- Settings ----------------------------------------------------------
-
-    def get_settings(self, eid: str) -> Dict[str, Any]:
-        return self._get(f"/environments/{eid}/settings")
-
-    def update_settings(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._put(f"/environments/{eid}/settings", json_data=data)
 
     # -- Templates ---------------------------------------------------------
 
@@ -636,25 +613,6 @@ class DockerLocal:
             return int(result.stdout.strip().split()[0])
         except (subprocess.TimeoutExpired, ValueError, IndexError):
             return None
-
-    def list_compose_containers(self, project: str) -> List[str]:
-        """Return container IDs belonging to a Docker Compose project."""
-        try:
-            result = subprocess.run(
-                [
-                    "docker", "ps", "-a",
-                    "--filter", f"label=com.docker.compose.project={project}",
-                    "--format", "{{.ID}}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode != 0:
-                return []
-            return [cid.strip() for cid in result.stdout.strip().splitlines() if cid.strip()]
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return []
 
 
 # ---------------------------------------------------------------------------
