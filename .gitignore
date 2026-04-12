@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Migration runtime artifacts
+migration_*.log
+migration_export/
+migration_state.json
+
+# Environment
+.env
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
