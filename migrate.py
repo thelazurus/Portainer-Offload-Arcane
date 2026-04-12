@@ -1445,8 +1445,8 @@ class MigrationEngine:
         self.ui.phase_header(2, 7, "Discovery & Audit")
         discovery: Dict[str, Any] = {}
 
-        # Count items to discover: 8 for CE, 12 for EE
-        total_items = 12 if self._is_ee() else 8
+        # Count items to discover: 9 for CE, 13 for EE (includes settings)
+        total_items = 13 if self._is_ee() else 9
 
         with self.ui.create_progress() as progress:
             task = progress.add_task("Discovering resources...", total=total_items)
@@ -1610,6 +1610,7 @@ class MigrationEngine:
                 "edition": "CE + EE",
                 "data": settings,
             }
+            progress.advance(task)
 
         self.discovery = discovery
         self.ui.show_discovery_summary(discovery, self.config.portainer_edition)
@@ -2473,7 +2474,7 @@ class MigrationEngine:
                 file_resp = self.portainer.get_stack_file(stack.get("Id", ""))
                 compose_content = file_resp.get("StackFileContent", "")
                 if not compose_content.strip():
-                    self.report.record_failure("stacks", name, "Empty compose file")
+                    self.report.record_failure("Stacks", name, "Empty compose file")
                     self.ui.error(f"Stack '{name}': compose file is empty, skipping")
                     continue
                 payload = self._transform_stack_to_project(stack, compose_content)
@@ -3288,7 +3289,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     logger = setup_logging(config)
-    logger.info(f"Migration tool v{__version__} starting on {config.platform_name}")
+    logger.info("Migration tool v%s starting on %s", __version__, config.platform_name)
 
     try:
         engine = MigrationEngine(config, logger)

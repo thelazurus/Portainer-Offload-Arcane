@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/plans/` with complete implementation plan (design, UI/UX wireframes, API mappings)
 - `README.md`, `CHANGELOG.md`, `CLAUDE.md` documentation
 
-## [0.1.0] - 2026-04-12
+## [0.1.0] - 2026-04-11
 
 ### Added
 - Initial project scaffold (`migrate.py`, `requirements.txt`)
