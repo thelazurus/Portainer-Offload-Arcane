@@ -83,6 +83,8 @@ import hashlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import platform  # noqa: E402
+import secrets  # noqa: E402
+import shlex  # noqa: E402
 import shutil  # noqa: E402
 from dataclasses import dataclass, field, asdict  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
@@ -324,8 +326,8 @@ class PortainerClient:
 
     # -- Docker proxy methods ----------------------------------------------
 
-    def list_containers(self, all: bool = True) -> List[Dict[str, Any]]:
-        params = {"all": "true"} if all else {}
+    def list_containers(self, all_containers: bool = True) -> List[Dict[str, Any]]:
+        params = {"all": "true"} if all_containers else {}
         return self._docker("/containers/json", params)
 
     def inspect_container(self, container_id: str) -> Dict[str, Any]:
@@ -1299,7 +1301,7 @@ class ReportGenerator:
 
         for cmd in reversed(self.rollback_commands):
             lines.append(f"# {cmd['description']}")
-            lines.append(f'curl -X {cmd["method"]} "{cmd["url"]}" -H "X-API-Key: $API_KEY"')
+            lines.append(f'curl -X {cmd["method"]} {shlex.quote(cmd["url"])} -H "X-API-Key: $API_KEY"')
             lines.append("")
 
         with open(script_path, "w", encoding="utf-8") as fh:
@@ -1338,6 +1340,7 @@ class MigrationEngine:
         self.ui = WizardUI(config, logger)
         self.report = ReportGenerator(config, logger)
         self._git_repo_map: Dict[str, str] = {}  # stack_id -> arcane_repo_id
+        self._ee_exported: bool = False
         self.state = self._load_state()
         self.discovery: Dict[str, Any] = {}
 
@@ -1463,7 +1466,7 @@ class MigrationEngine:
             progress.advance(task)
 
             # Containers: separate standalone from compose-managed
-            containers = self.portainer.list_containers(all=True)
+            containers = self.portainer.list_containers(all_containers=True)
             standalone = [
                 c for c in containers
                 if not c.get("Labels", {}).get("com.docker.compose.project")
@@ -1956,7 +1959,7 @@ class MigrationEngine:
 
         return {
             "username": user.get("Username", ""),
-            "password": "ChangeMe123!",
+            "password": secrets.token_urlsafe(16),
             "roles": roles,
         }
 
@@ -2126,12 +2129,14 @@ class MigrationEngine:
         if self._should_include("settings"):
             settings = self.discovery.get("settings", {}).get("data", {})
 
+            SENSITIVE_TERMS = ("password", "secret", "token", "key", "credential", "auth", "cert", "private")
+
             def _mask_settings(obj: Any) -> Any:
                 if isinstance(obj, dict):
                     masked = {}
                     for k, v in obj.items():
                         if isinstance(k, str) and any(
-                            s in k.lower() for s in ("password", "secret")
+                            s in k.lower() for s in SENSITIVE_TERMS
                         ):
                             masked[k] = "***MASKED***"
                         else:
@@ -2149,37 +2154,44 @@ class MigrationEngine:
         if self._is_ee():
             ee_dir = base / "ee_reference"
 
-            teams = self.discovery.get("teams", {}).get("data", [])
-            _write_json(ee_dir / "teams.json", teams)
-            manifest["counts"]["teams"] = len(teams)
-            self.ui.info(f"EE reference: {len(teams)} teams")
+            if self._should_include("teams"):
+                teams = self.discovery.get("teams", {}).get("data", [])
+                _write_json(ee_dir / "teams.json", teams)
+                manifest["counts"]["teams"] = len(teams)
+                self.ui.info(f"EE reference: {len(teams)} teams")
 
-            try:
-                memberships = self.portainer.list_team_memberships()
-            except Exception:
-                memberships = []
-            _write_json(ee_dir / "team_memberships.json", memberships)
-            manifest["counts"]["team_memberships"] = len(memberships)
-            self.ui.info(f"EE reference: {len(memberships)} team memberships")
+            if self._should_include("team_memberships"):
+                try:
+                    memberships = self.portainer.list_team_memberships()
+                except Exception:
+                    memberships = []
+                _write_json(ee_dir / "team_memberships.json", memberships)
+                manifest["counts"]["team_memberships"] = len(memberships)
+                self.ui.info(f"EE reference: {len(memberships)} team memberships")
 
-            roles = self.discovery.get("roles", {}).get("data", [])
-            _write_json(ee_dir / "roles.json", roles)
-            manifest["counts"]["roles"] = len(roles)
-            self.ui.info(f"EE reference: {len(roles)} roles")
+            if self._should_include("roles"):
+                roles = self.discovery.get("roles", {}).get("data", [])
+                _write_json(ee_dir / "roles.json", roles)
+                manifest["counts"]["roles"] = len(roles)
+                self.ui.info(f"EE reference: {len(roles)} roles")
 
-            try:
-                resource_controls = self.portainer.list_resource_controls()
-            except Exception:
-                resource_controls = []
-            _write_json(ee_dir / "resource_controls.json", resource_controls)
-            manifest["counts"]["resource_controls"] = len(resource_controls)
-            self.ui.info(f"EE reference: {len(resource_controls)} resource controls")
+            if self._should_include("resource_controls"):
+                try:
+                    resource_controls = self.portainer.list_resource_controls()
+                except Exception:
+                    resource_controls = []
+                _write_json(ee_dir / "resource_controls.json", resource_controls)
+                manifest["counts"]["resource_controls"] = len(resource_controls)
+                self.ui.info(f"EE reference: {len(resource_controls)} resource controls")
 
-            edge_stacks = self.discovery.get("edge_stacks", {}).get("data", [])
-            if edge_stacks:
-                _write_json(ee_dir / "edge_stacks.json", edge_stacks)
-                manifest["counts"]["edge_stacks"] = len(edge_stacks)
-                self.ui.info(f"EE reference: {len(edge_stacks)} edge stacks")
+            if self._should_include("edge_stacks"):
+                edge_stacks = self.discovery.get("edge_stacks", {}).get("data", [])
+                if edge_stacks:
+                    _write_json(ee_dir / "edge_stacks.json", edge_stacks)
+                    manifest["counts"]["edge_stacks"] = len(edge_stacks)
+                    self.ui.info(f"EE reference: {len(edge_stacks)} edge stacks")
+
+            self._ee_exported = True
 
         # ---- Manifest ----
         _write_json(base / "manifest.json", manifest)
@@ -2218,10 +2230,11 @@ class MigrationEngine:
                 fh.write(backup_bytes)
 
             size = backup_path.stat().st_size
-            if size < 100:
-                self.ui.warning(
-                    f"Portainer backup is suspiciously small ({size} bytes)"
-                )
+            if size < 1024:
+                self.ui.warning(f"Backup file is only {backup_path.stat().st_size} bytes -- may be corrupt")
+                if not Confirm.ask("  Continue without a valid backup?", default=False):
+                    self._mark_phase(phase, "failed")
+                    return
             else:
                 self.ui.success(f"Portainer backup saved ({size:,} bytes)")
             self._mark_phase(phase, "completed")
@@ -2459,6 +2472,10 @@ class MigrationEngine:
             try:
                 file_resp = self.portainer.get_stack_file(stack.get("Id", ""))
                 compose_content = file_resp.get("StackFileContent", "")
+                if not compose_content.strip():
+                    self.report.record_failure("stacks", name, "Empty compose file")
+                    self.ui.error(f"Stack '{name}': compose file is empty, skipping")
+                    continue
                 payload = self._transform_stack_to_project(stack, compose_content)
                 result = self._execute_or_log(
                     f"Create project '{name}'",
@@ -2568,6 +2585,8 @@ class MigrationEngine:
                     payload,
                 )
                 target_id = result.get("Id", result.get("id", "")) if isinstance(result, dict) else ""
+                if not target_id and not self.config.dry_run:
+                    self.ui.warning(f"Container '{name}' created but no ID returned; cannot start")
                 self.report.record_success("Containers", name, cid, target_id)
                 if not self.config.dry_run:
                     self.report.add_rollback(
@@ -2691,7 +2710,7 @@ class MigrationEngine:
                         f"Delete user '{username}'",
                     )
                 self.report.add_action_item(
-                    f"User '{username}' was created with default password 'ChangeMe123!' -- must be changed"
+                    f"User '{username}' was created with a random password -- set a new password via Arcane admin"
                 )
                 self._record_migrated(phase, uid)
             except Exception as exc:
@@ -2738,6 +2757,12 @@ class MigrationEngine:
             self._mark_phase(phase, "completed")
             return
 
+        # If _export_to_disk already wrote EE files, skip duplicate writes
+        if self._ee_exported:
+            self.ui.info("EE RBAC files already written during export phase -- skipping duplicate")
+            self._mark_phase(phase, "completed")
+            return
+
         self._mark_phase(phase, "in_progress")
         base = Path(self.config.backup_dir) / "ee_reference"
 
@@ -2752,23 +2777,27 @@ class MigrationEngine:
             count = len(data) if isinstance(data, list) else 1
             self.report.record_ee_export(label, count, str(filepath))
 
-        teams = self.discovery.get("teams", {}).get("data", [])
-        _write("teams.json", teams, "Teams")
+        if self._should_include("teams"):
+            teams = self.discovery.get("teams", {}).get("data", [])
+            _write("teams.json", teams, "Teams")
 
-        try:
-            memberships = self.portainer.list_team_memberships()
-        except Exception:
-            memberships = []
-        _write("team_memberships.json", memberships, "Team Memberships")
+        if self._should_include("team_memberships"):
+            try:
+                memberships = self.portainer.list_team_memberships()
+            except Exception:
+                memberships = []
+            _write("team_memberships.json", memberships, "Team Memberships")
 
-        roles = self.discovery.get("roles", {}).get("data", [])
-        _write("roles.json", roles, "Roles")
+        if self._should_include("roles"):
+            roles = self.discovery.get("roles", {}).get("data", [])
+            _write("roles.json", roles, "Roles")
 
-        try:
-            resource_controls = self.portainer.list_resource_controls()
-        except Exception:
-            resource_controls = []
-        _write("resource_controls.json", resource_controls, "Resource Controls")
+        if self._should_include("resource_controls"):
+            try:
+                resource_controls = self.portainer.list_resource_controls()
+            except Exception:
+                resource_controls = []
+            _write("resource_controls.json", resource_controls, "Resource Controls")
 
         self._mark_phase(phase, "completed")
         self.ui.success("EE RBAC reference exported")
@@ -2933,14 +2962,14 @@ class MigrationEngine:
             self.portainer = PortainerClient(self.config, self.logger)
 
             try:
-                info = self.portainer.test_connection()
+                self.portainer.test_connection()
                 self.ui.success(f"Connected to Portainer at {self.config.portainer_url}")
             except Exception as exc:
                 self.ui.error(f"Cannot connect to Portainer: {exc}")
                 return
 
             try:
-                edition_info = self.portainer.detect_edition()
+                self.portainer.detect_edition()
                 self.ui.show_edition_panel(
                     self.config.portainer_edition,
                     self.config.portainer_version,
@@ -3243,9 +3272,17 @@ if __name__ == "__main__":
         try:
             with open(args.config, "r", encoding="utf-8") as f:
                 cfg_data = json.load(f)
+            SAFE_CONFIG_KEYS = {
+                "portainer_url", "portainer_api_key", "portainer_endpoint_id", "portainer_ssl_verify",
+                "arcane_url", "arcane_api_key", "arcane_username", "arcane_password",
+                "arcane_environment_id", "arcane_ssl_verify",
+                "strategy", "dry_run", "backup_dir", "log_file",
+            }
             for key, value in cfg_data.items():
-                if hasattr(config, key):
+                if key in SAFE_CONFIG_KEYS:
                     setattr(config, key, value)
+                else:
+                    console.print(f"[yellow]Ignoring unknown config key: {key}[/]")
         except Exception as e:
             console.print(f"[red]Error loading config: {e}[/]")
             sys.exit(1)
