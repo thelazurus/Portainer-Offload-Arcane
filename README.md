@@ -5,6 +5,14 @@
     <a href="https://getarcane.app">Arcane</a> — stacks, containers, volumes,
     registries, users, and everything in between.
   </p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/version-0.3.0-blue?style=flat-square" alt="Version">
+    <img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
+    <img src="https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey?style=flat-square" alt="Platform">
+    <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
+    <img src="https://img.shields.io/badge/portainer-CE%20%2B%20EE-13BEF9?style=flat-square&logo=portainer&logoColor=white" alt="Portainer CE + EE">
+    <img src="https://img.shields.io/badge/target-Arcane-blueviolet?style=flat-square" alt="Arcane">
+  </p>
 </p>
 
 ---
@@ -293,4 +301,6 @@ MIT
 
 <p align="center">
   <sub>Built for the move from Portainer to <a href="https://getarcane.app">Arcane</a>.</sub>
+  <br>
+  <sub>A <a href="http://randomsynergy.com">RandomSynergy Productions</a> project.</sub>
 </p>
