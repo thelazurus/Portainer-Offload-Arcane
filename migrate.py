@@ -95,6 +95,25 @@ from typing import Optional, List, Dict, Any, Callable  # noqa: E402
 
 console = Console()
 
+DISPLAY_NAMES = {
+    "stacks": "Stacks",
+    "standalone_containers": "Standalone Containers",
+    "images": "Images",
+    "volumes": "Volumes",
+    "networks": "Networks",
+    "registries": "Registries",
+    "custom_templates": "Custom Templates",
+    "users": "Users",
+    "webhooks": "Webhooks",
+    "teams": "Teams",
+    "roles": "Roles",
+    "edge_stacks": "Edge Stacks",
+    "settings": "Settings",
+    "team_memberships": "Team Memberships",
+    "resource_controls": "Resource Controls",
+    "activity_logs": "Activity Logs",
+}
+
 # ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
@@ -341,7 +360,7 @@ class ArcaneClient:
         self.logger = logger
         self.session = http_requests.Session()
         self.session.verify = config.arcane_ssl_verify
-        self.base_url = config.arcane_url.rstrip("/")
+        self.base_url = config.arcane_url.rstrip("/") + "/api"
 
     # -- auth helpers ------------------------------------------------------
 
@@ -429,18 +448,18 @@ class ArcaneClient:
     # -- Registries --------------------------------------------------------
 
     def list_registries(self) -> List[Dict[str, Any]]:
-        return self._get("/registries")
+        return self._get("/container-registries")
 
     def create_registry(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._post("/registries", json_data=data)
+        return self._post("/container-registries", json_data=data)
 
     # -- Git repos ---------------------------------------------------------
 
     def list_git_repos(self) -> List[Dict[str, Any]]:
-        return self._get("/git-repos")
+        return self._get("/customize/git-repositories")
 
     def create_git_repo(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._post("/git-repos", json_data=data)
+        return self._post("/customize/git-repositories", json_data=data)
 
     # -- Projects ----------------------------------------------------------
 
@@ -481,7 +500,7 @@ class ArcaneClient:
     ) -> Dict[str, Any]:
         with open(filepath, "rb") as fh:
             return self._post(
-                f"/environments/{eid}/volumes/{name}/backup",
+                f"/environments/{eid}/volumes/{name}/backups/upload",
                 files={"file": (os.path.basename(filepath), fh, "application/gzip")},
             )
 
@@ -869,19 +888,19 @@ class WizardUI:
             data = discovery.get(rtype, {})
             count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
             details = data.get("details", "") if isinstance(data, dict) else ""
-            table.add_row(rtype.replace("_", " ").title(), str(count), str(details), "CE+EE")
+            table.add_row(DISPLAY_NAMES.get(rtype, rtype), str(count), str(details), "CE+EE")
 
         # EE-only resources
         if edition == "EE":
             ee_types = [
                 "webhooks", "teams", "team_memberships", "roles",
-                "resource_controls", "edge_stacks",
+                "resource_controls", "edge_stacks", "activity_logs",
             ]
             for rtype in ee_types:
                 data = discovery.get(rtype, {})
                 count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
                 details = data.get("details", "") if isinstance(data, dict) else ""
-                table.add_row(rtype.replace("_", " ").title(), str(count), str(details), "EE only")
+                table.add_row(DISPLAY_NAMES.get(rtype, rtype), str(count), str(details), "EE only")
 
         self.console.print(table)
 
@@ -938,7 +957,7 @@ class WizardUI:
         ]
         ee_types = [
             "webhooks", "teams", "team_memberships", "roles",
-            "resource_controls", "edge_stacks",
+            "resource_controls", "edge_stacks", "activity_logs",
         ]
 
         if migrate_all:
@@ -957,8 +976,9 @@ class WizardUI:
         for rt in core_types:
             data = discovery.get(rt, {})
             count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+            display = DISPLAY_NAMES.get(rt, rt)
             if count > 0 and Confirm.ask(
-                f"    [blue]Migrate {rt.replace('_', ' ')}?[/blue] ({count} found)",
+                f"    [blue]Migrate {display}?[/blue] ({count} found)",
                 default=True,
             ):
                 self.config.selected_items[rt] = []
@@ -968,8 +988,9 @@ class WizardUI:
             for rt in ee_types:
                 data = discovery.get(rt, {})
                 count = data.get("count", 0) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+                display = DISPLAY_NAMES.get(rt, rt)
                 if count > 0 and Confirm.ask(
-                    f"    [blue]Migrate {rt.replace('_', ' ')}?[/blue] ({count} found)",
+                    f"    [blue]Migrate {display}?[/blue] ({count} found)",
                     default=True,
                 ):
                     self.config.selected_items[rt] = []
@@ -987,15 +1008,15 @@ class WizardUI:
 
         has_fail = False
         for r in results:
-            status = r.get("status", "PASS")
-            if status == "PASS":
+            status = r.get("status", "pass")
+            if status == "pass":
                 styled_status = "[green]PASS[/green]"
-            elif status == "WARN":
+            elif status == "warn":
                 styled_status = "[yellow]WARN[/yellow]"
             else:
                 styled_status = "[red]FAIL[/red]"
                 has_fail = True
-            table.add_row(r.get("check", ""), styled_status, r.get("details", ""))
+            table.add_row(r.get("name", ""), styled_status, r.get("details", ""))
 
         self.console.print(table)
 
@@ -1311,9 +1332,9 @@ class MigrationEngine:
         self.docker = DockerLocal(config, logger)
         self.ui = WizardUI(config, logger)
         self.report = ReportGenerator(config, logger)
+        self._git_repo_map: Dict[str, str] = {}  # stack_id -> arcane_repo_id
         self.state = self._load_state()
         self.discovery: Dict[str, Any] = {}
-        self._git_repo_map: Dict[str, str] = {}  # stack_id -> arcane_repo_id
 
     # ------------------------------------------------------------------
     # Task 7: Checkpoint & State Management
@@ -1333,6 +1354,7 @@ class MigrationEngine:
                     self.logger.info(
                         "Resuming from checkpoint: %s", cp
                     )
+                    self._git_repo_map = saved.get("git_repo_map", {})
                     return saved
                 self.logger.warning(
                     "Checkpoint config_hash mismatch -- starting fresh"
@@ -1349,6 +1371,7 @@ class MigrationEngine:
 
     def _save_state(self):
         """Write state to checkpoint file as JSON."""
+        self.state["git_repo_map"] = self._git_repo_map
         try:
             with open(self.config.checkpoint_file, "w", encoding="utf-8") as fh:
                 json.dump(self.state, fh, indent=2, default=str)
@@ -1426,7 +1449,7 @@ class MigrationEngine:
             compose_stacks = [s for s in stacks if s.get("Type") == 2]
             git_stacks = [s for s in compose_stacks if s.get("GitConfig")]
             file_stacks = [s for s in compose_stacks if not s.get("GitConfig")]
-            discovery["Stacks"] = {
+            discovery["stacks"] = {
                 "count": len(compose_stacks),
                 "details": f"{len(file_stacks)} file-based, {len(git_stacks)} git-based",
                 "edition": "CE + EE",
@@ -1441,7 +1464,7 @@ class MigrationEngine:
                 if not c.get("Labels", {}).get("com.docker.compose.project")
             ]
             compose_count = len(containers) - len(standalone)
-            discovery["Standalone Containers"] = {
+            discovery["standalone_containers"] = {
                 "count": len(standalone),
                 "details": f"({compose_count} compose-managed excluded)",
                 "edition": "CE + EE",
@@ -1453,7 +1476,7 @@ class MigrationEngine:
             images = self.portainer.list_images()
             total_size = sum(img.get("Size", 0) for img in images)
             size_gb = total_size / (1024**3)
-            discovery["Images"] = {
+            discovery["images"] = {
                 "count": len(images),
                 "details": f"{size_gb:.1f} GB total",
                 "edition": "CE + EE",
@@ -1464,7 +1487,7 @@ class MigrationEngine:
             # Volumes
             vol_data = self.portainer.list_volumes()
             volumes = vol_data.get("Volumes", []) or []
-            discovery["Volumes"] = {
+            discovery["volumes"] = {
                 "count": len(volumes),
                 "details": "",
                 "edition": "CE + EE",
@@ -1478,7 +1501,7 @@ class MigrationEngine:
             user_networks = [
                 n for n in networks if n.get("Name") not in default_nets
             ]
-            discovery["Networks"] = {
+            discovery["networks"] = {
                 "count": len(user_networks),
                 "details": f"({len(networks) - len(user_networks)} default excluded)",
                 "edition": "CE + EE",
@@ -1488,7 +1511,7 @@ class MigrationEngine:
 
             # Registries
             registries = self.portainer.list_registries()
-            discovery["Registries"] = {
+            discovery["registries"] = {
                 "count": len(registries),
                 "details": ", ".join(
                     r.get("Name", "")[:20] for r in registries[:3]
@@ -1500,7 +1523,7 @@ class MigrationEngine:
 
             # Custom Templates
             templates = self.portainer.list_custom_templates()
-            discovery["Custom Templates"] = {
+            discovery["custom_templates"] = {
                 "count": len(templates),
                 "details": ", ".join(
                     t.get("Title", "")[:20] for t in templates[:3]
@@ -1512,7 +1535,7 @@ class MigrationEngine:
 
             # Users
             users = self.portainer.list_users()
-            discovery["Users"] = {
+            discovery["users"] = {
                 "count": len(users),
                 "details": ", ".join(u.get("Username", "") for u in users[:4]),
                 "edition": "CE + EE",
@@ -1523,7 +1546,7 @@ class MigrationEngine:
             # --- EE-only resources ---
             if self._is_ee():
                 webhooks = self.portainer.list_webhooks()
-                discovery["Webhooks"] = {
+                discovery["webhooks"] = {
                     "count": len(webhooks),
                     "details": "",
                     "edition": "EE",
@@ -1532,7 +1555,7 @@ class MigrationEngine:
                 progress.advance(task)
 
                 teams = self.portainer.list_teams()
-                discovery["Teams"] = {
+                discovery["teams"] = {
                     "count": len(teams),
                     "details": ", ".join(
                         t.get("Name", "") for t in teams[:3]
@@ -1543,7 +1566,7 @@ class MigrationEngine:
                 progress.advance(task)
 
                 roles = self.portainer.list_roles()
-                discovery["Roles"] = {
+                discovery["roles"] = {
                     "count": len(roles),
                     "details": "",
                     "edition": "EE",
@@ -1552,7 +1575,7 @@ class MigrationEngine:
                 progress.advance(task)
 
                 edge_stacks = self.portainer.list_edge_stacks()
-                discovery["Edge Stacks"] = {
+                discovery["edge_stacks"] = {
                     "count": len(edge_stacks),
                     "details": "(detected)" if edge_stacks else "(none)",
                     "edition": "EE",
@@ -1563,7 +1586,7 @@ class MigrationEngine:
                 # CE: attempt webhooks gracefully
                 webhooks = self.portainer.list_webhooks()
                 if webhooks:
-                    discovery["Webhooks"] = {
+                    discovery["webhooks"] = {
                         "count": len(webhooks),
                         "details": "",
                         "edition": "CE",
@@ -1572,7 +1595,7 @@ class MigrationEngine:
 
             # Settings (always export as reference)
             settings = self.portainer.get_settings()
-            discovery["Settings"] = {
+            discovery["settings"] = {
                 "count": 1,
                 "details": "Exported for reference",
                 "edition": "CE + EE",
@@ -1612,6 +1635,15 @@ class MigrationEngine:
             result["awsSecretAccessKey"] = ecr.get("SecretAccessKey", "")
             result["awsRegion"] = ecr.get("Region", "")
 
+        # Warn about registries that may need manual credential verification
+        if port_type in (2, 3, 5):
+            type_names = {2: "Quay.io", 3: "Azure ACR", 5: "GitLab"}
+            self.logger.warning(
+                "Registry '%s' (type: %s) -- credentials may need manual verification in Arcane",
+                reg.get("Name", ""),
+                type_names.get(port_type, "unknown"),
+            )
+
         return result
 
     def _transform_stack_to_project(self, stack: dict, compose_content: str) -> dict:
@@ -1626,6 +1658,8 @@ class MigrationEngine:
             if v.get("name")
         ]
         env_content = "\n".join(env_lines)
+        if env_content:
+            env_content += "\n"
 
         return {
             "name": stack.get("Name", ""),
@@ -1703,6 +1737,8 @@ class MigrationEngine:
                     entry["gateway"] = subnet_cfg["Gateway"]
                 if subnet_cfg.get("IPRange"):
                     entry["ipRange"] = subnet_cfg["IPRange"]
+                if subnet_cfg.get("AuxAddress"):
+                    entry["auxAddress"] = subnet_cfg["AuxAddress"]
                 if entry:
                     ipam["config"].append(entry)
         if ipam_cfg.get("Options"):
@@ -1766,18 +1802,6 @@ class MigrationEngine:
         # --- Restart policy ---
         restart_policy = host_config.get("RestartPolicy", {}) or {}
 
-        # --- Healthcheck ---
-        healthcheck_raw = config.get("Healthcheck", {}) or {}
-        healthcheck: Dict[str, Any] = {}
-        if healthcheck_raw:
-            healthcheck = {
-                "Test": healthcheck_raw.get("Test", []) or [],
-                "Interval": healthcheck_raw.get("Interval", 0),
-                "Timeout": healthcheck_raw.get("Timeout", 0),
-                "Retries": healthcheck_raw.get("Retries", 0),
-                "StartPeriod": healthcheck_raw.get("StartPeriod", 0),
-            }
-
         # --- Devices ---
         devices_raw = host_config.get("Devices", []) or []
         devices = [
@@ -1797,52 +1821,80 @@ class MigrationEngine:
         # --- Exposed ports ---
         exposed_ports = config.get("ExposedPorts", {}) or {}
 
+        # --- Volumes as list of strings (Source:Destination:Mode) ---
+        volume_strings: List[str] = []
+        for mount in mounts_raw:
+            src = mount.get("Source", "")
+            dst = mount.get("Destination", "")
+            mode = mount.get("Mode", "")
+            if src and dst:
+                entry_str = f"{src}:{dst}"
+                if mode:
+                    entry_str += f":{mode}"
+                volume_strings.append(entry_str)
+            elif dst:
+                volume_strings.append(dst)
+        # Also add any Binds not already represented
+        for bind in binds:
+            if bind not in volume_strings:
+                volume_strings.append(bind)
+
+        # --- Restart policy as string ---
+        restart_name = restart_policy.get("Name", "")
+        max_retry = restart_policy.get("MaximumRetryCount", 0)
+        if restart_name == "on-failure" and max_retry:
+            restart_str = f"on-failure:{max_retry}"
+        else:
+            restart_str = restart_name
+
         # --- Build the result ---
         result: Dict[str, Any] = {
             # From Config
-            "Image": config.get("Image", ""),
-            "Env": config.get("Env", []) or [],
-            "Cmd": config.get("Cmd", []) or [],
-            "Entrypoint": config.get("Entrypoint", []) or [],
-            "Labels": config.get("Labels", {}) or {},
-            "Hostname": config.get("Hostname", ""),
-            "Domainname": config.get("Domainname", ""),
-            "User": config.get("User", ""),
-            "WorkingDir": config.get("WorkingDir", ""),
-            "Tty": config.get("Tty", False),
-            "OpenStdin": config.get("OpenStdin", False),
-            "ExposedPorts": exposed_ports,
-            # HostConfig
-            "HostConfig": {
-                "NetworkMode": host_config.get("NetworkMode", "default"),
-                "PortBindings": port_bindings,
-                "Binds": binds,
-                "Memory": host_config.get("Memory", 0),
-                "MemorySwap": host_config.get("MemorySwap", 0),
-                "NanoCpus": host_config.get("NanoCpus", 0),
-                "CpuShares": host_config.get("CpuShares", 0),
-                "Privileged": host_config.get("Privileged", False),
-                "CapAdd": host_config.get("CapAdd", []) or [],
-                "CapDrop": host_config.get("CapDrop", []) or [],
-                "SecurityOpt": host_config.get("SecurityOpt", []) or [],
-                "ReadonlyRootfs": host_config.get("ReadonlyRootfs", False),
-                "Devices": devices,
-                "PidsLimit": host_config.get("PidsLimit", 0),
-                "AutoRemove": host_config.get("AutoRemove", False),
-                "Dns": dns,
-                "DnsSearch": dns_search,
-                "DnsOptions": dns_options,
-                "RestartPolicy": {
-                    "Name": restart_policy.get("Name", ""),
-                    "MaximumRetryCount": restart_policy.get("MaximumRetryCount", 0),
-                },
+            "image": config.get("Image", ""),
+            "env": config.get("Env", []) or [],
+            "cmd": config.get("Cmd", []) or [],
+            "entrypoint": config.get("Entrypoint", []) or [],
+            "labels": config.get("Labels", {}) or {},
+            "hostname": config.get("Hostname", ""),
+            "domainname": config.get("Domainname", ""),
+            "user": config.get("User", ""),
+            "workingDir": config.get("WorkingDir", ""),
+            "tty": config.get("Tty", False),
+            "openStdin": config.get("OpenStdin", False),
+            "volumes": volume_strings,
+            "restartPolicy": restart_str,
+            "privileged": host_config.get("Privileged", False),
+            # hostConfig
+            "hostConfig": {
+                "networkMode": host_config.get("NetworkMode", "default"),
+                "portBindings": port_bindings,
+                "memory": host_config.get("Memory") or 0,
+                "memorySwap": host_config.get("MemorySwap") or 0,
+                "nanoCpus": host_config.get("NanoCpus") or 0,
+                "cpuShares": host_config.get("CpuShares") or 0,
+                "capAdd": host_config.get("CapAdd", []) or [],
+                "capDrop": host_config.get("CapDrop", []) or [],
+                "securityOpt": host_config.get("SecurityOpt", []) or [],
+                "readonlyRootfs": host_config.get("ReadonlyRootfs", False),
+                "devices": devices,
+                "pidsLimit": host_config.get("PidsLimit") or 0,
+                "autoRemove": host_config.get("AutoRemove", False),
+                "dns": dns,
+                "dnsSearch": dns_search,
+                "dnsOptions": dns_options,
             },
-            "Mounts": mounts,
         }
 
-        # Add Healthcheck only if present
-        if healthcheck:
-            result["Healthcheck"] = healthcheck
+        # Add healthcheck only if present (prefer runtime override: H2)
+        healthcheck_raw = host_config.get("Healthcheck") or config.get("Healthcheck")
+        if healthcheck_raw:
+            result["healthcheck"] = {
+                "test": healthcheck_raw.get("Test", []) or [],
+                "interval": healthcheck_raw.get("Interval", 0),
+                "timeout": healthcheck_raw.get("Timeout", 0),
+                "retries": healthcheck_raw.get("Retries", 0),
+                "startPeriod": healthcheck_raw.get("StartPeriod", 0),
+            }
 
         # Attach container name (strip leading /)
         name = inspect_data.get("Name", "")
@@ -1917,8 +1969,8 @@ class MigrationEngine:
                 fh.write(text)
 
         # ---- Registries ----
-        if self._should_include("Registries"):
-            registries = self.discovery.get("Registries", {}).get("data", [])
+        if self._should_include("registries"):
+            registries = self.discovery.get("registries", {}).get("data", [])
             masked = []
             for r in registries:
                 entry = dict(r)
@@ -1930,14 +1982,14 @@ class MigrationEngine:
             self.ui.success(f"Exported {len(masked)} registries")
 
         # ---- Stacks ----
-        if self._should_include("Stacks"):
-            stacks = self.discovery.get("Stacks", {}).get("data", [])
+        if self._should_include("stacks"):
+            stacks = self.discovery.get("stacks", {}).get("data", [])
             for stack in stacks:
                 name = stack.get("Name", f"stack_{stack.get('Id', 'unknown')}")
                 stack_dir = base / "stacks" / name
                 # Compose file
                 try:
-                    file_resp = self.portainer.get_stack_file(stack["Id"])
+                    file_resp = self.portainer.get_stack_file(stack.get("Id", ""))
                     compose_content = file_resp.get("StackFileContent", "")
                 except Exception:
                     compose_content = ""
@@ -1955,8 +2007,8 @@ class MigrationEngine:
             self.ui.success(f"Exported {len(stacks)} stacks")
 
         # ---- Standalone Containers ----
-        if self._should_include("Standalone Containers"):
-            containers = self.discovery.get("Standalone Containers", {}).get("data", [])
+        if self._should_include("standalone_containers"):
+            containers = self.discovery.get("standalone_containers", {}).get("data", [])
             inspected = []
             for c in containers:
                 cid = c.get("Id", "")
@@ -1971,15 +2023,15 @@ class MigrationEngine:
             self.ui.success(f"Exported {len(inspected)} standalone containers")
 
         # ---- Networks ----
-        if self._should_include("Networks"):
-            networks = self.discovery.get("Networks", {}).get("data", [])
+        if self._should_include("networks"):
+            networks = self.discovery.get("networks", {}).get("data", [])
             _write_json(base / "networks" / "networks.json", networks)
             manifest["counts"]["networks"] = len(networks)
             self.ui.success(f"Exported {len(networks)} networks")
 
         # ---- Volumes ----
-        if self._should_include("Volumes"):
-            volumes = self.discovery.get("Volumes", {}).get("data", [])
+        if self._should_include("volumes"):
+            volumes = self.discovery.get("volumes", {}).get("data", [])
             _write_json(base / "volumes" / "volumes.json", volumes)
             manifest["counts"]["volumes"] = len(volumes)
             # Backup volume data if Docker is available
@@ -1999,13 +2051,13 @@ class MigrationEngine:
                 self.ui.info(f"Exported {len(volumes)} volumes (metadata only -- no Docker)")
 
         # ---- Custom Templates ----
-        if self._should_include("Custom Templates"):
-            templates = self.discovery.get("Custom Templates", {}).get("data", [])
+        if self._should_include("custom_templates"):
+            templates = self.discovery.get("custom_templates", {}).get("data", [])
             enriched = []
             for t in templates:
                 entry = dict(t)
                 try:
-                    file_resp = self.portainer.get_custom_template_file(t["Id"])
+                    file_resp = self.portainer.get_custom_template_file(t.get("Id", ""))
                     entry["FileContent"] = file_resp.get("FileContent", "")
                 except Exception:
                     entry["FileContent"] = ""
@@ -2015,8 +2067,8 @@ class MigrationEngine:
             self.ui.success(f"Exported {len(enriched)} custom templates")
 
         # ---- Users ----
-        if self._should_include("Users"):
-            users = self.discovery.get("Users", {}).get("data", [])
+        if self._should_include("users"):
+            users = self.discovery.get("users", {}).get("data", [])
             cleaned = []
             for u in users:
                 entry = dict(u)
@@ -2027,15 +2079,15 @@ class MigrationEngine:
             self.ui.success(f"Exported {len(cleaned)} users")
 
         # ---- Webhooks ----
-        if self._should_include("Webhooks"):
-            webhooks = self.discovery.get("Webhooks", {}).get("data", [])
+        if self._should_include("webhooks"):
+            webhooks = self.discovery.get("webhooks", {}).get("data", [])
             _write_json(base / "webhooks" / "webhooks.json", webhooks)
             manifest["counts"]["webhooks"] = len(webhooks)
             self.ui.success(f"Exported {len(webhooks)} webhooks")
 
         # ---- Settings ----
-        if self._should_include("Settings"):
-            settings = self.discovery.get("Settings", {}).get("data", {})
+        if self._should_include("settings"):
+            settings = self.discovery.get("settings", {}).get("data", {})
 
             def _mask_settings(obj: Any) -> Any:
                 if isinstance(obj, dict):
@@ -2060,7 +2112,7 @@ class MigrationEngine:
         if self._is_ee():
             ee_dir = base / "ee_reference"
 
-            teams = self.discovery.get("Teams", {}).get("data", [])
+            teams = self.discovery.get("teams", {}).get("data", [])
             _write_json(ee_dir / "teams.json", teams)
             manifest["counts"]["teams"] = len(teams)
             self.ui.info(f"EE reference: {len(teams)} teams")
@@ -2073,7 +2125,7 @@ class MigrationEngine:
             manifest["counts"]["team_memberships"] = len(memberships)
             self.ui.info(f"EE reference: {len(memberships)} team memberships")
 
-            roles = self.discovery.get("Roles", {}).get("data", [])
+            roles = self.discovery.get("roles", {}).get("data", [])
             _write_json(ee_dir / "roles.json", roles)
             manifest["counts"]["roles"] = len(roles)
             self.ui.info(f"EE reference: {len(roles)} roles")
@@ -2086,7 +2138,7 @@ class MigrationEngine:
             manifest["counts"]["resource_controls"] = len(resource_controls)
             self.ui.info(f"EE reference: {len(resource_controls)} resource controls")
 
-            edge_stacks = self.discovery.get("Edge Stacks", {}).get("data", [])
+            edge_stacks = self.discovery.get("edge_stacks", {}).get("data", [])
             if edge_stacks:
                 _write_json(ee_dir / "edge_stacks.json", edge_stacks)
                 manifest["counts"]["edge_stacks"] = len(edge_stacks)
@@ -2159,12 +2211,12 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Registries already migrated -- skipping")
             return
-        if not self._should_include("Registries"):
+        if not self._should_include("registries"):
             self.ui.info("Registries not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
-        registries = self.discovery.get("Registries", {}).get("data", [])
+        registries = self.discovery.get("registries", {}).get("data", [])
 
         for reg in registries:
             reg_id = str(reg.get("Id", ""))
@@ -2181,11 +2233,12 @@ class MigrationEngine:
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Registries", name, reg_id, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/container-registries/{target_id}",
-                    f"Delete registry '{name}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/container-registries/{target_id}",
+                        f"Delete registry '{name}'",
+                    )
                 self._record_migrated(phase, reg_id)
             except Exception as exc:
                 self.logger.error("Failed to migrate registry %s: %s", name, exc)
@@ -2200,12 +2253,12 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Git repos already migrated -- skipping")
             return
-        if not self._should_include("Stacks"):
+        if not self._should_include("stacks"):
             self.ui.info("Stacks not selected -- skipping git repos")
             return
 
         self._mark_phase(phase, "in_progress")
-        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        stacks = self.discovery.get("stacks", {}).get("data", [])
         git_stacks = [s for s in stacks if s.get("GitConfig")]
 
         for stack in git_stacks:
@@ -2224,11 +2277,12 @@ class MigrationEngine:
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self._git_repo_map[stack_id] = str(target_id)
                 self.report.record_success("Git Repos", name, stack_id, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/customize/git-repositories/{target_id}",
-                    f"Delete git repo for '{name}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/customize/git-repositories/{target_id}",
+                        f"Delete git repo for '{name}'",
+                    )
                 self._record_migrated(phase, stack_id)
             except Exception as exc:
                 self.logger.error("Failed to migrate git repo for %s: %s", name, exc)
@@ -2243,13 +2297,13 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Networks already migrated -- skipping")
             return
-        if not self._should_include("Networks"):
+        if not self._should_include("networks"):
             self.ui.info("Networks not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
         eid = self.config.arcane_environment_id
-        networks = self.discovery.get("Networks", {}).get("data", [])
+        networks = self.discovery.get("networks", {}).get("data", [])
 
         for net in networks:
             net_id = net.get("Id", "")
@@ -2267,11 +2321,12 @@ class MigrationEngine:
                 )
                 target_id = result.get("Id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Networks", name, net_id, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/environments/{eid}/networks/{target_id}",
-                    f"Delete network '{name}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/environments/{eid}/networks/{target_id}",
+                        f"Delete network '{name}'",
+                    )
                 self._record_migrated(phase, net_id)
             except Exception as exc:
                 self.logger.error("Failed to migrate network %s: %s", name, exc)
@@ -2286,13 +2341,13 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Volumes already migrated -- skipping")
             return
-        if not self._should_include("Volumes"):
+        if not self._should_include("volumes"):
             self.ui.info("Volumes not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
         eid = self.config.arcane_environment_id
-        volumes = self.discovery.get("Volumes", {}).get("data", [])
+        volumes = self.discovery.get("volumes", {}).get("data", [])
 
         for vol in volumes:
             name = vol.get("Name", "")
@@ -2313,11 +2368,12 @@ class MigrationEngine:
                 )
                 target_id = name  # volumes are identified by name
                 self.report.record_success("Volumes", name, name, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/environments/{eid}/volumes/{name}",
-                    f"Delete volume '{name}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/environments/{eid}/volumes/{name}",
+                        f"Delete volume '{name}'",
+                    )
                 # Upload backup if it exists
                 backup_file = (
                     Path(self.config.backup_dir) / "volumes" / "backups" / f"{name}.tar.gz"
@@ -2342,13 +2398,13 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Stacks already migrated -- skipping")
             return
-        if not self._should_include("Stacks"):
+        if not self._should_include("stacks"):
             self.ui.info("Stacks not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
         eid = self.config.arcane_environment_id
-        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        stacks = self.discovery.get("stacks", {}).get("data", [])
         file_stacks = [s for s in stacks if not s.get("GitConfig")]
 
         for stack in file_stacks:
@@ -2358,7 +2414,7 @@ class MigrationEngine:
                 self.report.record_skip("Stacks", name, "already migrated")
                 continue
             try:
-                file_resp = self.portainer.get_stack_file(stack["Id"])
+                file_resp = self.portainer.get_stack_file(stack.get("Id", ""))
                 compose_content = file_resp.get("StackFileContent", "")
                 payload = self._transform_stack_to_project(stack, compose_content)
                 result = self._execute_or_log(
@@ -2369,11 +2425,12 @@ class MigrationEngine:
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Stacks", name, stack_id, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/environments/{eid}/projects/{target_id}/destroy",
-                    f"Destroy project '{name}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/environments/{eid}/projects/{target_id}/destroy",
+                        f"Destroy project '{name}'",
+                    )
                 self._record_migrated(phase, stack_id)
             except Exception as exc:
                 self.logger.error("Failed to migrate stack %s: %s", name, exc)
@@ -2388,13 +2445,13 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("GitOps syncs already migrated -- skipping")
             return
-        if not self._should_include("Stacks"):
+        if not self._should_include("stacks"):
             self.ui.info("Stacks not selected -- skipping GitOps syncs")
             return
 
         self._mark_phase(phase, "in_progress")
         eid = self.config.arcane_environment_id
-        stacks = self.discovery.get("Stacks", {}).get("data", [])
+        stacks = self.discovery.get("stacks", {}).get("data", [])
         git_stacks = [s for s in stacks if s.get("GitConfig")]
 
         for stack in git_stacks:
@@ -2434,13 +2491,13 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Containers already migrated -- skipping")
             return
-        if not self._should_include("Standalone Containers"):
+        if not self._should_include("standalone_containers"):
             self.ui.info("Containers not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
         eid = self.config.arcane_environment_id
-        containers = self.discovery.get("Standalone Containers", {}).get("data", [])
+        containers = self.discovery.get("standalone_containers", {}).get("data", [])
 
         for c in containers:
             cid = c.get("Id", "")
@@ -2461,10 +2518,11 @@ class MigrationEngine:
                 )
                 target_id = result.get("Id", result.get("id", "")) if isinstance(result, dict) else ""
                 self.report.record_success("Containers", name, cid, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/environments/{eid}/containers/{target_id}?force=true",
-                    f"Delete container '{name}'",
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/environments/{eid}/containers/{target_id}?force=true",
+                        f"Delete container '{name}'",
                 )
                 # Start the container if it was running
                 state = inspect_data.get("State", {})
@@ -2493,12 +2551,12 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Templates already migrated -- skipping")
             return
-        if not self._should_include("Custom Templates"):
+        if not self._should_include("custom_templates"):
             self.ui.info("Custom Templates not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
-        templates = self.discovery.get("Custom Templates", {}).get("data", [])
+        templates = self.discovery.get("custom_templates", {}).get("data", [])
 
         for t in templates:
             tid = str(t.get("Id", ""))
@@ -2507,7 +2565,7 @@ class MigrationEngine:
                 self.report.record_skip("Custom Templates", name, "already migrated")
                 continue
             try:
-                file_resp = self.portainer.get_custom_template_file(t["Id"])
+                file_resp = self.portainer.get_custom_template_file(t.get("Id", ""))
                 file_content = file_resp.get("FileContent", "")
                 payload = self._transform_custom_template(t, file_content)
                 result = self._execute_or_log(
@@ -2517,9 +2575,10 @@ class MigrationEngine:
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Custom Templates", name, tid, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/templates/{target_id}",
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/templates/{target_id}",
                     f"Delete template '{name}'",
                 )
                 self._record_migrated(phase, tid)
@@ -2536,12 +2595,12 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Users already migrated -- skipping")
             return
-        if not self._should_include("Users"):
+        if not self._should_include("users"):
             self.ui.info("Users not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
-        users = self.discovery.get("Users", {}).get("data", [])
+        users = self.discovery.get("users", {}).get("data", [])
 
         # Get existing Arcane users to avoid duplicates
         try:
@@ -2572,11 +2631,12 @@ class MigrationEngine:
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Users", username, uid, target_id)
-                self.report.add_rollback(
-                    "DELETE",
-                    f"{self.arcane.base_url}/users/{target_id}",
-                    f"Delete user '{username}'",
-                )
+                if not self.config.dry_run:
+                    self.report.add_rollback(
+                        "DELETE",
+                        f"{self.arcane.base_url}/users/{target_id}",
+                        f"Delete user '{username}'",
+                    )
                 self.report.add_action_item(
                     f"User '{username}' was created with default password 'ChangeMe123!' -- must be changed"
                 )
@@ -2594,12 +2654,12 @@ class MigrationEngine:
         if self._phase_status(phase) == "completed":
             self.ui.info("Webhooks already handled -- skipping")
             return
-        if not self._should_include("Webhooks"):
+        if not self._should_include("webhooks"):
             self.ui.info("Webhooks not selected -- skipping")
             return
 
         self._mark_phase(phase, "in_progress")
-        webhooks = self.discovery.get("Webhooks", {}).get("data", [])
+        webhooks = self.discovery.get("webhooks", {}).get("data", [])
 
         for wh in webhooks:
             wh_id = str(wh.get("Id", ""))
@@ -2638,7 +2698,7 @@ class MigrationEngine:
             count = len(data) if isinstance(data, list) else 1
             self.report.record_ee_export(label, count, str(filepath))
 
-        teams = self.discovery.get("Teams", {}).get("data", [])
+        teams = self.discovery.get("teams", {}).get("data", [])
         _write("teams.json", teams, "Teams")
 
         try:
@@ -2647,7 +2707,7 @@ class MigrationEngine:
             memberships = []
         _write("team_memberships.json", memberships, "Team Memberships")
 
-        roles = self.discovery.get("Roles", {}).get("data", [])
+        roles = self.discovery.get("roles", {}).get("data", [])
         _write("roles.json", roles, "Roles")
 
         try:
@@ -2669,7 +2729,7 @@ class MigrationEngine:
             self.ui.info("Not EE edition -- skipping audit export")
             self._mark_phase(phase, "completed")
             return
-        if not self._should_include("Activity Logs"):
+        if not self._should_include("activity_logs"):
             self.ui.info("Activity Logs not selected -- skipping audit export")
             self._mark_phase(phase, "completed")
             return
@@ -2732,7 +2792,7 @@ class MigrationEngine:
             existing_names = {
                 p.get("name", "").lower() for p in existing_projects
             }
-            portainer_stacks = self.discovery.get("stacks", {}).get("items", [])
+            portainer_stacks = self.discovery.get("stacks", {}).get("data", [])
             conflicts = [
                 s.get("Name", s.get("name", ""))
                 for s in portainer_stacks
@@ -2797,10 +2857,13 @@ class MigrationEngine:
             # Check for existing checkpoint
             cp = self.config.checkpoint_file
             if os.path.isfile(cp):
-                resume = Confirm.ask(
-                    "[yellow]Existing checkpoint found.[/] Resume previous migration?",
-                    default=True,
-                )
+                if args and getattr(args, "resume", False):
+                    resume = True
+                else:
+                    resume = Confirm.ask(
+                        "[yellow]Existing checkpoint found.[/] Resume previous migration?",
+                        default=True,
+                    )
                 if not resume:
                     os.remove(cp)
                     self.state = self._load_state()
@@ -2836,7 +2899,17 @@ class MigrationEngine:
                 self.ui.error(f"Cannot detect Portainer edition: {exc}")
                 return
 
-            endpoints = self.portainer.list_endpoints()
+            # Mark EE-only phases as completed on CE so all-done check works
+            if not self._is_ee():
+                for phase in ["ee_rbac_export", "ee_audit_export"]:
+                    if self._phase_status(phase) == "pending":
+                        self._mark_phase(phase, "completed")
+
+            try:
+                endpoints = self.portainer.list_endpoints()
+            except Exception as exc:
+                self.ui.error(f"Cannot list Portainer endpoints: {exc}")
+                return
             if not endpoints:
                 self.ui.error("No Portainer endpoints found. Cannot continue.")
                 return
