@@ -1976,39 +1976,11 @@ class MigrationEngine:
                 for binding in (host_list or [])
             ]
 
-        # --- Mounts: preserve Source:Destination:Mode ---
+        # --- Binds ---
         binds = host_config.get("Binds", []) or []
-        mounts: List[Dict[str, Any]] = []
-        for mount in mounts_raw:
-            mount_entry: Dict[str, Any] = {
-                "type": mount.get("Type", "volume"),
-                "source": mount.get("Source", ""),
-                "destination": mount.get("Destination", ""),
-                "mode": mount.get("Mode", ""),
-                "rw": mount.get("RW", True),
-            }
-            if mount.get("Driver"):
-                mount_entry["driver"] = mount["Driver"]
-            mounts.append(mount_entry)
 
         # --- Restart policy ---
         restart_policy = host_config.get("RestartPolicy", {}) or {}
-
-        # --- Devices ---
-        devices_raw = host_config.get("Devices", []) or []
-        devices = [
-            {
-                "PathOnHost": d.get("PathOnHost", ""),
-                "PathInContainer": d.get("PathInContainer", ""),
-                "CgroupPermissions": d.get("CgroupPermissions", "rwm"),
-            }
-            for d in devices_raw
-        ]
-
-        # --- DNS ---
-        dns = host_config.get("Dns", []) or []
-        dns_search = host_config.get("DnsSearch", []) or []
-        dns_options = host_config.get("DnsOptions", []) or []
 
         # --- Exposed ports ---
         exposed_ports = config.get("ExposedPorts", {}) or {}
@@ -2054,41 +2026,28 @@ class MigrationEngine:
             "tty": config.get("Tty", False),
             "openStdin": config.get("OpenStdin", False),
             "volumes": volume_strings,
-            "mounts": mounts,
             "exposedPorts": exposed_ports,
             "restartPolicy": restart_str,
             "privileged": host_config.get("Privileged", False),
-            # hostConfig
+            # hostConfig -- per ContainerHostConfigCreate schema
             "hostConfig": {
                 "networkMode": host_config.get("NetworkMode", "default"),
                 "portBindings": port_bindings,
+                "binds": binds,
                 "memory": host_config.get("Memory") or 0,
                 "memorySwap": host_config.get("MemorySwap") or 0,
                 "nanoCpus": host_config.get("NanoCpus") or 0,
                 "cpuShares": host_config.get("CpuShares") or 0,
-                "capAdd": host_config.get("CapAdd", []) or [],
-                "capDrop": host_config.get("CapDrop", []) or [],
-                "securityOpt": host_config.get("SecurityOpt", []) or [],
                 "readonlyRootfs": host_config.get("ReadonlyRootfs", False),
-                "devices": devices,
-                "pidsLimit": host_config.get("PidsLimit") or 0,
+                "privileged": host_config.get("Privileged", False),
+                "publishAllPorts": host_config.get("PublishAllPorts", False),
                 "autoRemove": host_config.get("AutoRemove", False),
-                "dns": dns,
-                "dnsSearch": dns_search,
-                "dnsOptions": dns_options,
+                "restartPolicy": {
+                    "name": restart_policy.get("Name", ""),
+                    "maximumRetryCount": restart_policy.get("MaximumRetryCount") or 0,
+                },
             },
         }
-
-        # Add healthcheck only if present (prefer runtime override: H2)
-        healthcheck_raw = host_config.get("Healthcheck") or config.get("Healthcheck")
-        if healthcheck_raw:
-            result["healthcheck"] = {
-                "test": healthcheck_raw.get("Test", []) or [],
-                "interval": healthcheck_raw.get("Interval") or 0,
-                "timeout": healthcheck_raw.get("Timeout") or 0,
-                "retries": healthcheck_raw.get("Retries") or 0,
-                "startPeriod": healthcheck_raw.get("StartPeriod") or 0,
-            }
 
         # Attach container name (strip leading /)
         name = inspect_data.get("Name", "")
@@ -3177,7 +3136,7 @@ class MigrationEngine:
                     version_str = (
                         version_info
                         if isinstance(version_info, str)
-                        else version_info.get("version", "unknown")
+                        else version_info.get("displayVersion", version_info.get("currentVersion", "unknown"))
                         if isinstance(version_info, dict)
                         else str(version_info)
                     )
@@ -3284,7 +3243,7 @@ class MigrationEngine:
                     version_str = (
                         version_info
                         if isinstance(version_info, str)
-                        else version_info.get("version", "unknown")
+                        else version_info.get("displayVersion", version_info.get("currentVersion", "unknown"))
                         if isinstance(version_info, dict)
                         else str(version_info)
                     )
