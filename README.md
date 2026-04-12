@@ -18,7 +18,7 @@ edition (CE or EE) and adjusts available features accordingly.
 | Standalone Containers | Full inspect | Containers (full fidelity) | CE + EE |
 | Custom Templates | Templates + compose | Arcane Templates | CE + EE |
 | Users | User accounts | Users | CE + EE |
-| Webhooks | Webhooks | Arcane Webhooks | EE |
+| Webhooks | Webhooks | Arcane Webhooks | CE + EE (best-effort) |
 | Teams / Roles / ACLs | RBAC config | Exported as reference JSON | EE |
 | Settings | Full settings | Exported as reference JSON | CE + EE |
 
