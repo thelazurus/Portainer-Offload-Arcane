@@ -39,16 +39,16 @@ prompts.
 ## Quick Start
 
 ```bash
-# Option A: Shell launcher (handles everything)
 ./migrate.sh
-
-# Option B: Direct Python
-pip install rich requests
-python migrate.py
 ```
 
-That's it. The wizard asks for your Portainer URL, API key, and Arcane
-credentials, then does the rest.
+That's it. The launcher checks your Python version, installs dependencies
+if needed, detects Docker availability, and drops you into the wizard.
+It asks for your Portainer URL, API key, and Arcane credentials, then
+does the rest.
+
+> **Alternative:** If you prefer to manage dependencies yourself, you can
+> run `pip install rich requests && python migrate.py` directly.
 
 ---
 
@@ -96,37 +96,40 @@ exactly where you left off.
 
 ## Usage
 
+All options pass through the shell launcher — it handles Python, pip, and
+dependency checks automatically, then forwards everything to `migrate.py`:
+
 ```bash
 # Interactive wizard (recommended)
-python migrate.py
+./migrate.sh
 
 # Export only — save everything to disk, don't touch Arcane
-python migrate.py --export-only
+./migrate.sh --export-only
 
 # Dry run — simulate the full migration, change nothing
-python migrate.py --dry-run
+./migrate.sh --dry-run
 
 # Resume — pick up an interrupted migration
-python migrate.py --resume
+./migrate.sh --resume
 
 # Import — push a previous export into Arcane (no Portainer needed)
-python migrate.py --import-dir ./migration_export
+./migrate.sh --import-dir ./migration_export
 
 # Config file — skip the prompts
-python migrate.py --config my-config.json
+./migrate.sh --config my-config.json
 
 # Skip backup — if you've already backed up Portainer
-python migrate.py --skip-backup
+./migrate.sh --skip-backup
+
+# Launcher-only: check prerequisites without starting
+./migrate.sh --check-only
+
+# Launcher-only: show help
+./migrate.sh --help
 ```
 
-Or use the shell launcher, which checks Python, pip, and dependencies for you:
-
-```bash
-./migrate.sh                     # Full wizard
-./migrate.sh --help              # See all options
-./migrate.sh --check-only        # Just verify prerequisites
-./migrate.sh --dry-run           # Dry run via launcher
-```
+> **Direct Python:** Every command above also works with `python migrate.py`
+> if you've installed `rich` and `requests` yourself.
 
 ---
 
