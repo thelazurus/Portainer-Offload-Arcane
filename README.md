@@ -52,7 +52,7 @@ python migrate.py --dry-run
 # Resume an interrupted migration
 python migrate.py --resume
 
-# Import from a previous export
+# Import from a previous export (planned for a future release)
 python migrate.py --import-dir ./migration_export
 
 # Load connection config from file

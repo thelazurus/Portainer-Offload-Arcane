@@ -9,6 +9,8 @@ build/
 migration_*.log
 migration_export/
 migration_state.json
+rollback.sh
+**/migration_report.json
 
 # Environment
 .env

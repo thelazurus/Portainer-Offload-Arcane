@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WizardUI`: Rich TUI wizard with phase headers, progress bars, tables, edition panels
 - `ReportGenerator`: JSON migration report, rollback shell script generation
 - `MigrationEngine`: Full orchestrator with checkpoint/resume, discovery, transforms, export, live migration
-  - 13 migration phases (registries, git repos, networks, volumes, stacks, GitOps syncs, containers, templates, users, webhooks, EE RBAC export, EE audit export)
+  - 13 migration phases (portainer backup, registries, git repos, networks, volumes, stacks, GitOps syncs, containers, templates, users, webhooks, EE RBAC export, EE audit export)
   - Export-to-disk with full directory structure
   - Edition-aware CE/EE branching throughout
   - Pre-flight checks (Arcane health, naming conflicts, disk space)
