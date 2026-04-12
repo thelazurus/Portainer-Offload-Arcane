@@ -887,6 +887,7 @@ class WizardUI:
         core_types = [
             "stacks", "standalone_containers", "volumes", "networks",
             "registries", "users", "custom_templates", "settings",
+            "webhooks",
         ]
         for rtype in core_types:
             data = discovery.get(rtype, {})
@@ -897,7 +898,7 @@ class WizardUI:
         # EE-only resources
         if edition == "EE":
             ee_types = [
-                "webhooks", "teams", "team_memberships", "roles",
+                "teams", "team_memberships", "roles",
                 "resource_controls", "edge_stacks", "activity_logs",
             ]
             for rtype in ee_types:
@@ -2232,7 +2233,7 @@ class MigrationEngine:
 
             size = backup_path.stat().st_size
             if size < 1024:
-                self.ui.warning(f"Backup file is only {backup_path.stat().st_size} bytes -- may be corrupt")
+                self.ui.warning(f"Backup file is only {size} bytes -- may be corrupt")
                 if not Confirm.ask("  Continue without a valid backup?", default=False):
                     self._mark_phase(phase, "failed")
                     return

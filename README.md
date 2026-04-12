@@ -124,10 +124,12 @@ migration_export/
 ├── stacks/
 │   ├── my-app/
 │   │   ├── docker-compose.yml
-│   │   └── .env
+│   │   ├── .env
+│   │   └── metadata.json
 │   └── monitoring/
 │       ├── docker-compose.yml
-│       └── .env
+│       ├── .env
+│       └── metadata.json
 ├── containers/
 │   └── standalone.json
 ├── networks/

@@ -19,7 +19,7 @@ migrate.py
 ├── WizardUI            Rich TUI (banners, tables, prompts, progress, edition panels)
 ├── ReportGenerator     JSON report + rollback script + console summary
 ├── MigrationEngine     Orchestrator (phases, checkpoints, transforms, CE/EE branching)
-└── main()              Argparse, config init, engine.run()
+└── __main__            Argparse, config init, engine.run()
 ```
 
 ## Key Design Decisions
