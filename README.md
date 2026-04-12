@@ -1,41 +1,90 @@
-# Portainer to Arcane Migration Tool
+<p align="center">
+  <h1 align="center">Portainer to Arcane Migration Tool</h1>
+  <p align="center">
+    Move your entire Docker management setup from Portainer CE/EE to
+    <a href="https://getarcane.app">Arcane</a> — stacks, containers, volumes,
+    registries, users, and everything in between.
+  </p>
+</p>
 
-A single-file Python CLI wizard that performs a complete migration from
-Portainer CE/EE to [Arcane](https://getarcane.app). Auto-detects your Portainer
-edition (CE or EE) and adjusts available features accordingly.
+---
 
-## What Gets Migrated
+## Why Arcane?
 
-| Resource | Portainer | Arcane | Edition |
-|----------|-----------|--------|---------|
-| Portainer Backup | Full `.tar.gz` backup | Local safety-net file | CE + EE |
-| Container Registries | Registries | Container Registries | CE + EE |
-| Git Repositories | Git-based stack configs | Git Repositories | CE + EE |
-| Networks | User-created networks | Networks | CE + EE |
-| Volumes + Data | Docker volumes | Volumes + backup upload | CE + EE |
-| Compose Stacks | Stacks + `.env` | Projects (compose + envContent) | CE + EE |
-| Git-based Stacks | Git stacks | GitOps Syncs | CE + EE |
-| Standalone Containers | Full inspect | Containers (full fidelity) | CE + EE |
-| Custom Templates | Templates + compose | Arcane Templates | CE + EE |
-| Users | User accounts | Users | CE + EE |
-| Webhooks | Webhooks | Arcane Webhooks | CE + EE (best-effort) |
-| Teams / Roles / ACLs | RBAC config | Exported as reference JSON | EE |
-| Settings | Full settings | Exported as reference JSON | CE + EE |
+[Arcane](https://getarcane.app) is a modern Docker management platform built
+for teams who've outgrown Portainer's limitations. It ships with GitOps syncs,
+built-in vulnerability scanning, volume browsing, image builds, and a UI that
+doesn't fight you. If you've been eyeing the switch, this tool makes it painless.
+
+## What This Tool Does
+
+A single Python file (`migrate.py`) that walks you through a guided,
+interactive migration wizard. It connects to your Portainer instance, discovers
+every resource, and either exports them for review or pushes them straight into
+Arcane — your choice.
+
+No downtime required. No manual YAML copying. Just run it and follow the
+prompts.
+
+---
 
 ## Quick Start
 
 ```bash
+# Option A: Shell launcher (handles everything)
+./migrate.sh
+
+# Option B: Direct Python
 pip install rich requests
 python migrate.py
 ```
 
-## Requirements
+That's it. The wizard asks for your Portainer URL, API key, and Arcane
+credentials, then does the rest.
 
-- Python 3.8+
-- `rich` and `requests` (auto-installed on first run if missing)
-- Portainer API key (generate in Portainer > My Account > Access Tokens)
-- Arcane API key or admin credentials
-- Optional: Docker CLI on the host (enables volume data backup)
+---
+
+## What Gets Migrated
+
+Everything that matters:
+
+| Resource | From Portainer | To Arcane | Edition |
+|----------|---------------|-----------|---------|
+| Compose Stacks | Stacks + `.env` files | Projects | CE + EE |
+| Git-based Stacks | Git stack configs | GitOps Syncs | CE + EE |
+| Standalone Containers | Full container inspect | Containers | CE + EE |
+| Docker Volumes | Volumes + data backup | Volumes + restore | CE + EE |
+| Networks | User-created networks | Networks | CE + EE |
+| Container Registries | All registry types | Registries | CE + EE |
+| Custom Templates | Templates + compose | Templates | CE + EE |
+| Users | Accounts + roles | Users | CE + EE |
+| Webhooks | Webhook configs | Webhooks | CE + EE |
+| Teams / Roles / ACLs | RBAC config | Reference export | EE |
+| Settings | Full config | Reference export | CE + EE |
+
+The tool also creates a **full Portainer backup** before touching anything, so
+you always have a way back.
+
+---
+
+## How It Works
+
+The wizard runs through 6 phases:
+
+```
+  1. Connect       Portainer + Arcane credentials, edition detection
+  2. Discover      Scan all resources, show summary table
+  3. Plan          Choose strategy (export-only, live, dry-run)
+  4. Pre-flight    Check Arcane health, naming conflicts, disk space
+  5. Execute       Export to disk, then import to Arcane
+  6. Report        Summary table, JSON report, rollback script
+```
+
+Each phase has a progress bar, colored status indicators, and clear error
+messages. If something goes wrong mid-migration, checkpoint/resume picks up
+exactly where you left off.
+
+---
 
 ## Usage
 
@@ -43,59 +92,102 @@ python migrate.py
 # Interactive wizard (recommended)
 python migrate.py
 
-# Export Portainer data only (no import to Arcane)
+# Export only — save everything to disk, don't touch Arcane
 python migrate.py --export-only
 
-# Simulate without making any changes
+# Dry run — simulate the full migration, change nothing
 python migrate.py --dry-run
 
-# Resume an interrupted migration
+# Resume — pick up an interrupted migration
 python migrate.py --resume
 
-# Import from a previous export (skips Portainer connection, pushes to Arcane)
+# Import — push a previous export into Arcane (no Portainer needed)
 python migrate.py --import-dir ./migration_export
 
-# Load connection config from file
+# Config file — skip the prompts
 python migrate.py --config my-config.json
 
-# Skip the Portainer backup step
+# Skip backup — if you've already backed up Portainer
 python migrate.py --skip-backup
 ```
 
-## Modes
+Or use the shell launcher, which checks Python, pip, and dependencies for you:
+
+```bash
+./migrate.sh                     # Full wizard
+./migrate.sh --help              # See all options
+./migrate.sh --check-only        # Just verify prerequisites
+./migrate.sh --dry-run           # Dry run via launcher
+```
+
+---
+
+## Requirements
+
+| Requirement | Notes |
+|-------------|-------|
+| Python 3.8+ | Auto-detected by the launcher |
+| `rich` + `requests` | Auto-installed on first run if missing |
+| Portainer API key | Generate in Portainer > My Account > Access Tokens |
+| Arcane API key or login | Admin credentials for the target instance |
+| Docker CLI *(optional)* | Enables volume data backup when running on the host |
+
+---
+
+## Migration Modes
 
 ### Export-Only
 
 Saves all Portainer data to `./migration_export/` without touching Arcane.
-Useful for auditing, planning, or creating a portable backup of your
-Portainer configuration.
+Great for auditing what you have, planning the migration, or creating a
+portable backup of your entire Portainer configuration.
 
 ### Live Migration
 
-Exports data first, then imports everything into Arcane. Compose stacks are
-recreated as Arcane projects, standalone containers are rebuilt with full
+Exports first (safety net), then imports everything into Arcane. Compose
+stacks become Arcane projects, standalone containers are rebuilt with full
 config fidelity, and volume data is backed up and restored.
 
 ### Dry Run
 
-Simulates the entire migration end-to-end. All reads happen, all transforms
-run, but no writes are made to Arcane. Shows exactly what would happen.
+Runs the entire migration end-to-end — reads, transforms, API calls — but
+skips all writes. Shows you exactly what *would* happen. Perfect for a
+pre-flight check before the real thing.
+
+### Import from Export
+
+Already ran `--export-only`? Use `--import-dir` to push that export into
+Arcane without needing a live Portainer connection. Useful when Portainer
+has already been decommissioned.
+
+---
 
 ## Features
 
-- Auto-detects Portainer CE vs EE and adjusts features
-- Interactive TUI wizard with progress bars and colored output
-- Checkpoint/resume for interrupted migrations
-- Full container fidelity (capabilities, health checks, devices, DNS, resource limits)
-- Automatic Docker socket detection (local mode vs API-only remote mode)
-- Volume data backup via Docker CLI (when running on the Docker host)
-- Portainer backup triggered before any changes (safety net)
-- Rollback script generation
-- Detailed JSON migration report
-- Debug log file for troubleshooting
-- Cross-platform: Windows, Linux, macOS
+- **Edition-aware** — auto-detects Portainer CE vs EE, adjusts available
+  features, and handles graceful fallbacks for EE-only endpoints
+- **Interactive wizard** — rich TUI with progress bars, colored tables,
+  phase indicators, and clear prompts at every step
+- **Checkpoint/resume** — interrupted mid-migration? Run `--resume` and
+  pick up exactly where you left off
+- **Full container fidelity** — port bindings, restart policies, resource
+  limits, environment variables, volume mounts with mode preservation
+- **Volume data backup** — when Docker CLI is available, backs up actual
+  volume data as `.tar.gz` archives and restores them on the target
+- **Portainer backup** — triggers a full Portainer backup before any
+  changes, saved locally as your safety net
+- **Rollback script** — generates a `rollback.sh` with the exact API
+  calls to undo every resource created in Arcane
+- **Security hardened** — credentials masked in logs and exports, shell
+  injection protection in generated scripts, config file allowlist
+- **Cross-platform** — Windows, Linux, macOS. Path handling, Docker
+  socket detection, and terminal colors all adapt automatically
 
-## Config File Format
+---
+
+## Config File
+
+Skip the interactive prompts by providing a JSON config:
 
 ```json
 {
@@ -112,52 +204,93 @@ run, but no writes are made to Arcane. Shows exactly what would happen.
 }
 ```
 
-## Export Directory Structure
+---
+
+## Export Directory
+
+When you run `--export-only` or as part of any live migration, the tool
+creates a structured export:
 
 ```
 migration_export/
-├── manifest.json
+├── manifest.json                    # What was exported, when, from where
 ├── portainer_backup/
-│   └── portainer_backup.tar.gz
-├── registries/
-│   └── registries.json
+│   └── portainer_backup.tar.gz      # Full Portainer backup
 ├── stacks/
 │   ├── my-app/
-│   │   ├── docker-compose.yml
-│   │   ├── .env
-│   │   └── metadata.json
+│   │   ├── docker-compose.yml       # Compose file
+│   │   ├── .env                     # Environment variables
+│   │   └── metadata.json            # Stack metadata from Portainer
 │   └── monitoring/
 │       ├── docker-compose.yml
 │       ├── .env
 │       └── metadata.json
 ├── containers/
-│   └── standalone.json
+│   └── standalone.json              # Full inspect data for each container
+├── registries/
+│   └── registries.json              # Registry configs (credentials masked)
 ├── networks/
 │   └── networks.json
 ├── volumes/
 │   ├── volumes.json
-│   └── backups/
+│   └── backups/                     # Actual volume data (when Docker available)
 │       ├── postgres_data.tar.gz
 │       └── redis_data.tar.gz
 ├── templates/
 │   └── custom_templates.json
 ├── users/
-│   └── users.json
+│   └── users.json                   # Accounts (passwords not included)
 ├── webhooks/
 │   └── webhooks.json
 ├── settings/
-│   └── portainer_settings.json
-└── ee_reference/              (EE only)
+│   └── portainer_settings.json      # Full settings (secrets masked)
+└── ee_reference/                    # EE only
     ├── teams.json
     ├── team_memberships.json
     ├── roles.json
     └── resource_controls.json
 ```
 
+---
+
+## FAQ
+
+**Will this cause downtime?**
+No. The tool reads from Portainer and writes to Arcane. Your running
+containers are not stopped or restarted during migration.
+
+**Can I test it first?**
+Yes. Use `--dry-run` to simulate everything without making changes, or
+`--export-only` to just save your data locally.
+
+**What if something goes wrong?**
+The tool creates a full Portainer backup before starting. It also
+generates a `rollback.sh` script that can undo every resource it
+created in Arcane. And checkpoint/resume means you never lose progress.
+
+**Does it work with Portainer CE and EE?**
+Both. The tool auto-detects your edition and adjusts accordingly.
+EE-specific features (webhooks, teams, roles) are handled when
+available and gracefully skipped on CE.
+
+**Can I migrate from an export without a live Portainer?**
+Yes. Run `--export-only` while Portainer is still up, then later use
+`--import-dir ./migration_export` to push into Arcane — no Portainer
+connection needed.
+
+---
+
 ## Versioning
 
 This project uses [Semantic Versioning](https://semver.org/).
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
 MIT
+
+---
+
+<p align="center">
+  <sub>Built for the move from Portainer to <a href="https://getarcane.app">Arcane</a>.</sub>
+</p>
