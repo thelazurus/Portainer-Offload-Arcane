@@ -39,13 +39,26 @@ def check_dependencies():
         return
 
     print(f"Missing required packages: {', '.join(missing)}")
-    answer = input("Install them now with pip? [Y/n] ").strip().lower()
+    try:
+        answer = input("Install them now with pip? [Y/n] ").strip().lower()
+    except EOFError:
+        print(
+            "No TTY to prompt for install. Install manually:\n"
+            f"  {sys.executable} -m pip install {' '.join(missing)}"
+        )
+        sys.exit(1)
     if answer in ("", "y", "yes"):
+        # Dropped --quiet so pip failures (e.g. PEP 668 externally-managed)
+        # are visible to the user instead of silently cascading into an
+        # ImportError on restart.
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+            [sys.executable, "-m", "pip", "install"] + missing
         )
         print("Dependencies installed. Restarting...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # os.execv has surprising behaviour on Windows (parent may return
+        # immediately). Spawn a fresh subprocess and exit with its code.
+        result = subprocess.run([sys.executable, *sys.argv])
+        sys.exit(result.returncode)
     else:
         print("Cannot continue without required packages. Exiting.")
         sys.exit(1)
@@ -116,6 +129,33 @@ DISPLAY_NAMES = {
     "resource_controls": "Resource Controls",
     "activity_logs": "Activity Logs",
 }
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(password|passwd|secret|token|apikey|api_key|credential|authorization|"
+    r"accesskey|access_key|privatekey|private_key|awssecretaccesskey|bearer)",
+    re.IGNORECASE,
+)
+
+
+def _redact_sensitive(obj: Any) -> Any:
+    """Deep-copy *obj* with any value under a secret-looking key masked.
+
+    Used before logging or serializing payloads that may carry credentials
+    (registry passwords, user passwords, git tokens, AWS keys, etc.).
+    Keys matching ``_SENSITIVE_KEY_RE`` have their value replaced with
+    ``"[REDACTED]"``. Unknown types pass through unchanged.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: ("[REDACTED]" if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k) and v
+                else _redact_sensitive(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        cls = type(obj)
+        return cls(_redact_sensitive(v) for v in obj)
+    return obj
+
 
 # ---------------------------------------------------------------------------
 # Config dataclass
@@ -220,20 +260,38 @@ class PortainerClient:
         self.logger.debug("GET %s params=%s", url, params)
         resp = self.session.get(url, params=params, timeout=30)
         resp.raise_for_status()
-        return resp.json()
+        ctype = resp.headers.get("Content-Type", "")
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Expected JSON from {url}, got Content-Type={ctype!r}: "
+                f"{resp.text[:200]}"
+            ) from exc
 
     def _safe_get(
         self, path: str, params: Optional[Dict[str, Any]] = None
     ) -> Any:
-        """Like _get but returns [] on 404/403 (EE-only endpoints on CE)."""
+        """Like _get but returns [] on 404 (EE-only endpoint on CE).
+
+        403 is treated as a permission problem rather than a missing feature:
+        the caller is told their API key can't see the resource. The call
+        still degrades to an empty list so discovery/export proceeds, but the
+        WARNING lets the user know their data may be incomplete.
+        """
         try:
             return self._get(path, params)
         except http_requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code in (403, 404):
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 404:
                 self.logger.debug(
-                    "Endpoint %s returned %s -- treating as empty",
-                    path,
-                    exc.response.status_code,
+                    "Endpoint %s returned 404 -- treating as empty (EE-only?)", path
+                )
+                return []
+            if status == 403:
+                self.logger.warning(
+                    "Endpoint %s returned 403 -- your Portainer API key lacks "
+                    "permission; treating as empty", path
                 )
                 return []
             raise
@@ -300,13 +358,33 @@ class PortainerClient:
     def get_custom_template_file(self, template_id: int) -> Dict[str, Any]:
         return self._get(f"/api/custom_templates/{template_id}/file")
 
-    def trigger_backup(self, password: str = "") -> bytes:
-        """POST /api/backup -- returns raw tar.gz bytes."""
+    def trigger_backup(self, password: str = "", dest_path: Optional[str] = None) -> bytes:
+        """POST /api/backup.
+
+        If *dest_path* is provided, stream the response directly to disk and
+        return b"". Otherwise load the whole archive into memory and return
+        it (retained for backward-compat). Streaming is strongly preferred
+        for large Portainer instances where the archive can exceed RAM.
+        """
         url = f"{self.base_url}/api/backup"
         self.logger.debug("POST %s (backup)", url)
-        resp = self.session.post(url, json={"password": password}, timeout=120)
-        resp.raise_for_status()
-        return resp.content
+        if dest_path is None:
+            # Legacy in-memory path; kept for compatibility. Callers with
+            # large backups should pass dest_path to avoid OOM.
+            resp = self.session.post(
+                url, json={"password": password}, timeout=600
+            )
+            resp.raise_for_status()
+            return resp.content
+        with self.session.post(
+            url, json={"password": password}, timeout=600, stream=True
+        ) as resp:
+            resp.raise_for_status()
+            with open(dest_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+        return b""
 
     # -- EE-only methods ---------------------------------------------------
 
@@ -387,12 +465,18 @@ class ArcaneClient:
         json_data: Optional[Any] = None,
         params: Optional[Dict[str, Any]] = None,
         files: Optional[Any] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         """Generic request with auth, timeout, and error handling."""
         url = f"{self.base_url}{path}"
         headers = self._auth_headers()
-        log_data = "[REDACTED]" if "/auth/login" in path else json_data
-        self.logger.debug("%s %s json=%s params=%s", method, url, log_data, params)
+        self.logger.debug(
+            "%s %s json=%s params=%s",
+            method,
+            url,
+            _redact_sensitive(json_data),
+            _redact_sensitive(params),
+        )
         resp = self.session.request(
             method,
             url,
@@ -400,12 +484,26 @@ class ArcaneClient:
             json=json_data,
             params=params,
             files=files,
-            timeout=60,
+            timeout=timeout if timeout is not None else 60,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # Let HTTPError propagate, but surface the server's error body so
+            # the caller and final report can include a useful reason.
+            body_snippet = resp.text[:500] if resp.text else ""
+            self.logger.error(
+                "%s %s -> %s: %s", method, url, resp.status_code, body_snippet
+            )
+            resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {}
-        body = resp.json()
+        ctype = resp.headers.get("Content-Type", "")
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Expected JSON from {url}, got Content-Type={ctype!r}: "
+                f"{resp.text[:200]}"
+            ) from exc
         # Arcane wraps most responses in {"success": bool, "data": ...}.
         # Unwrap automatically so callers receive the inner payload directly.
         if isinstance(body, dict) and "data" in body and "success" in body:
@@ -420,8 +518,11 @@ class ArcaneClient:
         path: str,
         json_data: Optional[Any] = None,
         files: Optional[Any] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
-        return self._request("POST", path, json_data=json_data, files=files)
+        return self._request(
+            "POST", path, json_data=json_data, files=files, timeout=timeout
+        )
 
     def _put(self, path: str, json_data: Optional[Any] = None) -> Any:
         return self._request("PUT", path, json_data=json_data)
@@ -505,10 +606,19 @@ class ArcaneClient:
     def upload_volume_backup(
         self, eid: str, name: str, filepath: str
     ) -> Dict[str, Any]:
+        # Volume tarballs can be many GB; a 60s timeout would silently
+        # truncate large uploads. Scale the timeout to file size (~1 MB/s
+        # worst case) with a 10-minute floor and 4-hour cap.
+        try:
+            size = os.path.getsize(filepath)
+        except OSError:
+            size = 0
+        timeout = min(max(600.0, size / 1_000_000.0), 14_400.0)
         with open(filepath, "rb") as fh:
             return self._post(
                 f"/environments/{eid}/volumes/{name}/backups/upload",
                 files={"file": (os.path.basename(filepath), fh, "application/gzip")},
+                timeout=timeout,
             )
 
     # -- Containers --------------------------------------------------------
@@ -803,11 +913,16 @@ class WizardUI:
             )
 
         self.console.print(table)
-        choice = IntPrompt.ask(
-            "  [blue]Select endpoint #[/blue]", default=1
-        )
-        selected = endpoints[max(0, min(choice - 1, len(endpoints) - 1))]
-        return selected["Id"]
+        # Loop until a valid row is chosen. Previous implementation silently
+        # clamped out-of-range input to the first/last row -- dangerous for
+        # a destructive migration target.
+        while True:
+            choice = IntPrompt.ask("  [blue]Select endpoint #[/blue]", default=1)
+            if 1 <= choice <= len(endpoints):
+                return endpoints[choice - 1]["Id"]
+            self.console.print(
+                f"  [red]Please enter 1-{len(endpoints)}[/red]"
+            )
 
     def select_arcane_environment(self, environments: list) -> str:
         """Show numbered table of Arcane environments. Return environment ID."""
@@ -832,11 +947,16 @@ class WizardUI:
             table.add_row(str(idx), env_id, env_name, str(env_status))
 
         self.console.print(table)
-        choice = IntPrompt.ask(
-            "  [blue]Select environment #[/blue]", default=1
-        )
-        selected = environments[max(0, min(choice - 1, len(environments) - 1))]
-        return str(selected.get("id", selected.get("Id", "")))
+        while True:
+            choice = IntPrompt.ask(
+                "  [blue]Select environment #[/blue]", default=1
+            )
+            if 1 <= choice <= len(environments):
+                sel = environments[choice - 1]
+                return str(sel.get("id", sel.get("Id", "")))
+            self.console.print(
+                f"  [red]Please enter 1-{len(environments)}[/red]"
+            )
 
     # -- Discovery summary -------------------------------------------------
 
@@ -1321,24 +1441,35 @@ class MigrationEngine:
     def _load_state(self) -> dict:
         """Load from checkpoint file if exists and config_hash matches.
 
-        Otherwise return fresh state with all phases pending.
+        Otherwise return fresh state with all phases pending. A corrupt
+        checkpoint is treated as fatal rather than silently discarded: the
+        combination of non-atomic writes + silent reset would cause every
+        already-migrated item to be re-migrated on the next resume, creating
+        duplicates on Arcane.
         """
         cp = self.config.checkpoint_file
         if os.path.isfile(cp):
             try:
                 with open(cp, "r", encoding="utf-8") as fh:
                     saved = json.load(fh)
-                if saved.get("config_hash") == self.config.config_hash():
-                    self.logger.info(
-                        "Resuming from checkpoint: %s", cp
-                    )
-                    self._git_repo_map = saved.get("git_repo_map", {})
-                    return saved
-                self.logger.warning(
-                    "Checkpoint config_hash mismatch -- starting fresh"
-                )
-            except (json.JSONDecodeError, OSError) as exc:
-                self.logger.warning("Could not load checkpoint: %s", exc)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Checkpoint file {cp} is corrupt ({exc}). "
+                    f"Inspect the file manually; if you intend to start "
+                    f"fresh, delete it and re-run."
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not read checkpoint {cp}: {exc}"
+                ) from exc
+
+            if saved.get("config_hash") == self.config.config_hash():
+                self.logger.info("Resuming from checkpoint: %s", cp)
+                self._git_repo_map = saved.get("git_repo_map", {})
+                return saved
+            self.logger.warning(
+                "Checkpoint config_hash mismatch -- starting fresh"
+            )
 
         # Fresh state
         return {
@@ -1348,13 +1479,37 @@ class MigrationEngine:
         }
 
     def _save_state(self):
-        """Write state to checkpoint file as JSON."""
+        """Atomically write state to checkpoint file.
+
+        A naive open("w") + json.dump is not atomic: an interrupt between
+        truncate and flush leaves a zero-byte or partial file, and the
+        next ``--resume`` would then re-run every already-migrated item.
+        Write to a sibling temp file, fsync, and os.replace into place.
+        """
         self.state["git_repo_map"] = self._git_repo_map
+        cp = self.config.checkpoint_file
+        tmp = f"{cp}.tmp.{os.getpid()}"
         try:
-            with open(self.config.checkpoint_file, "w", encoding="utf-8") as fh:
-                json.dump(self.state, fh, indent=2, default=str)
-        except OSError as exc:
-            self.logger.warning("Could not save checkpoint: %s", exc)
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(self.state, fh, indent=2, default=str)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass  # fsync not supported (e.g., some network FS)
+                os.replace(tmp, cp)
+            except OSError as exc:
+                self.logger.warning("Could not save checkpoint: %s", exc)
+        finally:
+            # Always clean up the temp file — e.g. if json.dump raises
+            # TypeError on an unserializable value, the .tmp would otherwise
+            # linger and accumulate across runs.
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     def _phase_status(self, phase: str) -> str:
         """Return status of a phase from state."""
@@ -1401,7 +1556,14 @@ class MigrationEngine:
         """Dry-run wrapper: if dry_run, log and return stub; else call api_call."""
         if self.config.dry_run:
             self.ui.dry_run_msg(action)
-            self.logger.debug("[DRY RUN] %s args=%s kwargs=%s", action, args, kwargs)
+            # Redact registry passwords / user passwords / git tokens / AWS
+            # keys before they reach the debug log file on disk.
+            self.logger.debug(
+                "[DRY RUN] %s args=%s kwargs=%s",
+                action,
+                _redact_sensitive(args),
+                _redact_sensitive(kwargs),
+            )
             return {"dry_run": True, "action": action}
         return api_call(*args, **kwargs)
 
@@ -2152,8 +2314,20 @@ class MigrationEngine:
                 try:
                     file_resp = self.portainer.get_stack_file(stack.get("Id", ""))
                     compose_content = file_resp.get("StackFileContent", "")
-                except Exception:
+                except Exception as exc:
                     compose_content = ""
+                    self.logger.error(
+                        "Failed to fetch compose file for stack '%s': %s -- "
+                        "writing EMPTY docker-compose.yml", name, exc
+                    )
+                    self.report.record_failure(
+                        "Stacks", name,
+                        f"Compose file fetch failed: {exc}",
+                    )
+                    self.ui.warning(
+                        f"Stack '{name}' compose file unreadable -- "
+                        f"export written as empty placeholder"
+                    )
                 _write_text(stack_dir / "docker-compose.yml", compose_content)
                 # .env
                 env_vars = stack.get("Env", []) or []
@@ -2343,12 +2517,11 @@ class MigrationEngine:
             return
 
         try:
-            backup_bytes = self.portainer.trigger_backup(password)
             backup_dir = Path(self.config.backup_dir) / "portainer_backup"
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / "portainer_backup.tar.gz"
-            with open(backup_path, "wb") as fh:
-                fh.write(backup_bytes)
+            # Stream directly to disk so huge backups don't OOM the process.
+            self.portainer.trigger_backup(password, dest_path=str(backup_path))
 
             size = backup_path.stat().st_size
             if size < 1024:
@@ -2559,7 +2732,21 @@ class MigrationEngine:
                         self.arcane.upload_volume_backup(eid, name, str(backup_file))
                         self.ui.success(f"Volume '{name}' backup restored")
                     except Exception as upload_exc:
-                        self.ui.warning(f"Volume '{name}' backup upload failed: {upload_exc}")
+                        # Previously silently continued: user would see volume
+                        # "success" but the data was missing. Record as a
+                        # failure so the final report surfaces it.
+                        self.ui.error(
+                            f"Volume '{name}' created but backup data upload "
+                            f"FAILED: {upload_exc}"
+                        )
+                        self.logger.error(
+                            "Volume backup upload failed for %s: %s",
+                            name, upload_exc,
+                        )
+                        self.report.record_failure(
+                            "Volume Data", name,
+                            f"Upload failed: {upload_exc}",
+                        )
                 self._record_migrated(phase, name)
             except Exception as exc:
                 self.logger.error("Failed to migrate volume %s: %s", name, exc)
@@ -2740,7 +2927,21 @@ class MigrationEngine:
                         self.arcane.start_container(eid, target_id)
                         self.ui.info(f"Started container '{name}'")
                     except Exception as start_exc:
-                        self.ui.warning(f"Could not start container '{name}': {start_exc}")
+                        # Previously only warned: container was recorded as a
+                        # migration "success" even though it wasn't running.
+                        # Record as a partial failure so the final report
+                        # surfaces it as an action item.
+                        self.ui.error(
+                            f"Container '{name}' created but FAILED to start: "
+                            f"{start_exc}"
+                        )
+                        self.logger.error(
+                            "Container start failed for %s: %s", name, start_exc
+                        )
+                        self.report.record_failure(
+                            "Container Start", name,
+                            f"Created but start failed: {start_exc}",
+                        )
                 self._record_migrated(phase, cid)
             except Exception as exc:
                 self.logger.error("Failed to migrate container %s: %s", name, exc)
@@ -3094,7 +3295,10 @@ class MigrationEngine:
                         default=True,
                     )
                 if not resume:
-                    os.remove(cp)
+                    try:
+                        os.remove(cp)
+                    except FileNotFoundError:
+                        pass
                     self.state = self._load_state()
                     self.ui.info("Starting fresh migration")
                 else:
@@ -3391,8 +3595,10 @@ class MigrationEngine:
             )
             if all_done:
                 # Clean up checkpoint file
-                if os.path.isfile(self.config.checkpoint_file):
+                try:
                     os.remove(self.config.checkpoint_file)
+                except FileNotFoundError:
+                    pass
                 self.ui.success("Migration completed!")
             else:
                 self.ui.warning(
@@ -3408,6 +3614,15 @@ class MigrationEngine:
             self.logger.exception("Unhandled error in migration engine")
             self.ui.error(f"Migration failed: {exc}")
             self._save_state()
+        finally:
+            # Close HTTP sessions so connections aren't held open during
+            # the terminal restoration that follows a Rich alternate-screen
+            # teardown.
+            for client in (self.portainer, self.arcane):
+                try:
+                    client.session.close()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
