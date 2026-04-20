@@ -100,6 +100,7 @@ import secrets  # noqa: E402
 import re  # noqa: E402
 import shlex  # noqa: E402
 import shutil  # noqa: E402
+import time  # noqa: E402
 from dataclasses import dataclass, field, asdict  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -255,11 +256,33 @@ class PortainerClient:
     # -- low-level helpers -------------------------------------------------
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """GET *path* (relative to base_url) and return parsed JSON."""
+        """GET *path* (relative to base_url) and return parsed JSON.
+
+        Retries transient network errors (ConnectionError, Timeout) up to
+        three times with exponential backoff. Does NOT retry on HTTPError —
+        4xx/5xx are treated as authoritative responses.
+        """
         url = f"{self.base_url}{path}"
         self.logger.debug("GET %s params=%s", url, params)
-        resp = self.session.get(url, params=params, timeout=30)
-        resp.raise_for_status()
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+                break
+            except (
+                http_requests.exceptions.ConnectionError,
+                http_requests.exceptions.Timeout,
+            ) as exc:
+                last_exc = exc
+                if attempt == 2:
+                    raise
+                wait = 2 ** attempt
+                self.logger.warning(
+                    "GET %s transient failure (%s); retry in %ss",
+                    url, exc.__class__.__name__, wait,
+                )
+                time.sleep(wait)
         ctype = resp.headers.get("Content-Type", "")
         try:
             return resp.json()
@@ -297,9 +320,17 @@ class PortainerClient:
             raise
 
     def _docker(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """Proxied Docker API call via Portainer endpoint."""
+        """Proxied Docker API call via Portainer endpoint.
+
+        Surfaces endpoint ID in the exception message so a failure on a
+        multi-endpoint Portainer is easy to attribute.
+        """
         eid = self.config.portainer_endpoint_id
-        return self._get(f"/api/endpoints/{eid}/docker{path}", params)
+        try:
+            return self._get(f"/api/endpoints/{eid}/docker{path}", params)
+        except http_requests.exceptions.HTTPError as exc:
+            exc.args = (f"endpoint {eid}: {exc.args[0] if exc.args else exc}",)
+            raise
 
     def _safe_docker(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """Proxied Docker API call that returns [] on 404/403."""
@@ -1607,12 +1638,20 @@ class MigrationEngine:
         discovery: Dict[str, Any] = {}
 
         def _load_json(filepath: Path) -> Any:
-            """Load JSON from filepath, returning [] if missing."""
-            if filepath.is_file():
+            """Load JSON from filepath. Return [] if missing or malformed
+            (surfaces the filename in a warning so the user can fix it)."""
+            if not filepath.is_file():
+                self.logger.debug("Import file not found: %s", filepath)
+                return []
+            try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     return json.load(f)
-            self.logger.debug("Import file not found: %s", filepath)
-            return []
+            except (json.JSONDecodeError, OSError) as exc:
+                self.ui.warning(
+                    f"Skipping malformed import file {filepath}: {exc}"
+                )
+                self.logger.error("Malformed import file %s: %s", filepath, exc)
+                return []
 
         # ---- Registries ----
         registries = _load_json(base / "registries" / "registries.json")
@@ -1771,168 +1810,184 @@ class MigrationEngine:
         # Count items to discover: 9 for CE, 13 for EE (includes settings)
         total_items = 13 if self._is_ee() else 9
 
+        def _discover_one(rtype: str, edition: str, loader, transform):
+            """Run *loader()* → *transform(raw)* and drop the result into
+            discovery[rtype]. On failure, record the error and continue so a
+            single flaky endpoint doesn't abort the whole discovery phase.
+
+            *transform* receives the raw response and returns the discovery
+            dict body (without "edition" — added here).
+            """
+            try:
+                raw = loader()
+                body = transform(raw)
+            except Exception as exc:
+                self.logger.error("Discovery failed for %s: %s", rtype, exc)
+                self.ui.warning(f"{rtype} discovery failed: {exc}")
+                discovery[rtype] = {
+                    "count": 0,
+                    "details": f"[red]discovery failed: {exc}[/red]",
+                    "edition": edition,
+                    "data": [],
+                    "error": str(exc),
+                }
+                return
+            body.setdefault("edition", edition)
+            discovery[rtype] = body
+
         with self.ui.create_progress() as progress:
             task = progress.add_task("Discovering resources...", total=total_items)
 
             # --- CE + EE resources ---
 
-            # Stacks: classify as file-based vs git-based
-            stacks = self.portainer.list_stacks()
-            compose_stacks = [s for s in stacks if s.get("Type") == 2]
-            git_stacks = [s for s in compose_stacks if s.get("GitConfig")]
-            file_stacks = [s for s in compose_stacks if not s.get("GitConfig")]
-            discovery["stacks"] = {
-                "count": len(compose_stacks),
-                "details": f"{len(file_stacks)} file-based, {len(git_stacks)} git-based",
-                "edition": "CE + EE",
-                "data": compose_stacks,
-            }
+            def _stacks_transform(stacks):
+                compose = [s for s in stacks if s.get("Type") == 2]
+                git = [s for s in compose if s.get("GitConfig")]
+                file_ = [s for s in compose if not s.get("GitConfig")]
+                return {
+                    "count": len(compose),
+                    "details": f"{len(file_)} file-based, {len(git)} git-based",
+                    "data": compose,
+                }
+            _discover_one("stacks", "CE + EE",
+                          self.portainer.list_stacks, _stacks_transform)
             progress.advance(task)
 
-            # Containers: separate standalone from compose-managed
-            containers = self.portainer.list_containers(all_containers=True)
-            standalone = [
-                c for c in containers
-                if not c.get("Labels", {}).get("com.docker.compose.project")
-            ]
-            compose_count = len(containers) - len(standalone)
-            discovery["standalone_containers"] = {
-                "count": len(standalone),
-                "details": f"({compose_count} compose-managed excluded)",
-                "edition": "CE + EE",
-                "data": standalone,
-            }
+            def _containers_transform(containers):
+                standalone = [
+                    c for c in containers
+                    if not c.get("Labels", {}).get("com.docker.compose.project")
+                ]
+                compose_count = len(containers) - len(standalone)
+                return {
+                    "count": len(standalone),
+                    "details": f"({compose_count} compose-managed excluded)",
+                    "data": standalone,
+                }
+            _discover_one(
+                "standalone_containers", "CE + EE",
+                lambda: self.portainer.list_containers(all_containers=True),
+                _containers_transform,
+            )
             progress.advance(task)
 
-            # Images
-            images = self.portainer.list_images()
-            total_size = sum(img.get("Size", 0) for img in images)
-            size_gb = total_size / (1024**3)
-            discovery["images"] = {
-                "count": len(images),
-                "details": f"{size_gb:.1f} GB total",
-                "edition": "CE + EE",
-                "data": images,
-            }
+            def _images_transform(images):
+                total_size = sum(img.get("Size", 0) for img in images)
+                return {
+                    "count": len(images),
+                    "details": f"{total_size / (1024**3):.1f} GB total",
+                    "data": images,
+                }
+            _discover_one("images", "CE + EE",
+                          self.portainer.list_images, _images_transform)
             progress.advance(task)
 
-            # Volumes
-            vol_data = self.portainer.list_volumes()
-            volumes = vol_data.get("Volumes", []) or []
-            discovery["volumes"] = {
-                "count": len(volumes),
-                "details": "",
-                "edition": "CE + EE",
-                "data": volumes,
-            }
+            def _volumes_transform(vol_data):
+                volumes = (vol_data or {}).get("Volumes", []) or []
+                return {"count": len(volumes), "details": "", "data": volumes}
+            _discover_one("volumes", "CE + EE",
+                          self.portainer.list_volumes, _volumes_transform)
             progress.advance(task)
 
-            # Networks: filter out defaults
-            networks = self.portainer.list_networks()
-            default_nets = {"bridge", "host", "none", "ingress", "docker_gwbridge"}
-            user_networks = [
-                n for n in networks if n.get("Name") not in default_nets
-            ]
-            discovery["networks"] = {
-                "count": len(user_networks),
-                "details": f"({len(networks) - len(user_networks)} default excluded)",
-                "edition": "CE + EE",
-                "data": user_networks,
-            }
+            def _networks_transform(networks):
+                default_nets = {
+                    "bridge", "host", "none", "ingress", "docker_gwbridge",
+                }
+                user_nets = [
+                    n for n in networks if n.get("Name") not in default_nets
+                ]
+                return {
+                    "count": len(user_nets),
+                    "details": f"({len(networks) - len(user_nets)} default excluded)",
+                    "data": user_nets,
+                }
+            _discover_one("networks", "CE + EE",
+                          self.portainer.list_networks, _networks_transform)
             progress.advance(task)
 
-            # Registries
-            registries = self.portainer.list_registries()
-            discovery["registries"] = {
-                "count": len(registries),
-                "details": ", ".join(
-                    r.get("Name", "")[:20] for r in registries[:3]
-                ),
-                "edition": "CE + EE",
-                "data": registries,
-            }
+            def _registries_transform(regs):
+                return {
+                    "count": len(regs),
+                    "details": ", ".join(
+                        r.get("Name", "")[:20] for r in regs[:3]
+                    ),
+                    "data": regs,
+                }
+            _discover_one("registries", "CE + EE",
+                          self.portainer.list_registries, _registries_transform)
             progress.advance(task)
 
-            # Custom Templates
-            templates = self.portainer.list_custom_templates()
-            discovery["custom_templates"] = {
-                "count": len(templates),
-                "details": ", ".join(
-                    t.get("Title", "")[:20] for t in templates[:3]
-                ),
-                "edition": "CE + EE",
-                "data": templates,
-            }
+            def _templates_transform(templates):
+                return {
+                    "count": len(templates),
+                    "details": ", ".join(
+                        t.get("Title", "")[:20] for t in templates[:3]
+                    ),
+                    "data": templates,
+                }
+            _discover_one("custom_templates", "CE + EE",
+                          self.portainer.list_custom_templates, _templates_transform)
             progress.advance(task)
 
-            # Users
-            users = self.portainer.list_users()
-            discovery["users"] = {
-                "count": len(users),
-                "details": ", ".join(u.get("Username", "") for u in users[:4]),
-                "edition": "CE + EE",
-                "data": users,
-            }
+            def _users_transform(users):
+                return {
+                    "count": len(users),
+                    "details": ", ".join(u.get("Username", "") for u in users[:4]),
+                    "data": users,
+                }
+            _discover_one("users", "CE + EE",
+                          self.portainer.list_users, _users_transform)
             progress.advance(task)
 
             # --- EE-only resources ---
             if self._is_ee():
-                webhooks = self.portainer.list_webhooks()
-                discovery["webhooks"] = {
-                    "count": len(webhooks),
-                    "details": "",
-                    "edition": "EE",
-                    "data": webhooks,
-                }
+                _discover_one("webhooks", "EE", self.portainer.list_webhooks,
+                              lambda w: {"count": len(w), "details": "", "data": w})
                 progress.advance(task)
 
-                teams = self.portainer.list_teams()
-                discovery["teams"] = {
-                    "count": len(teams),
-                    "details": ", ".join(
-                        t.get("Name", "") for t in teams[:3]
-                    ),
-                    "edition": "EE",
-                    "data": teams,
-                }
+                _discover_one("teams", "EE", self.portainer.list_teams,
+                              lambda t: {
+                                  "count": len(t),
+                                  "details": ", ".join(
+                                      x.get("Name", "") for x in t[:3]
+                                  ),
+                                  "data": t,
+                              })
                 progress.advance(task)
 
-                roles = self.portainer.list_roles()
-                discovery["roles"] = {
-                    "count": len(roles),
-                    "details": "",
-                    "edition": "EE",
-                    "data": roles,
-                }
+                _discover_one("roles", "EE", self.portainer.list_roles,
+                              lambda r: {"count": len(r), "details": "", "data": r})
                 progress.advance(task)
 
-                edge_stacks = self.portainer.list_edge_stacks()
-                discovery["edge_stacks"] = {
-                    "count": len(edge_stacks),
-                    "details": "(detected)" if edge_stacks else "(none)",
-                    "edition": "EE",
-                    "data": edge_stacks,
-                }
+                _discover_one("edge_stacks", "EE", self.portainer.list_edge_stacks,
+                              lambda e: {
+                                  "count": len(e),
+                                  "details": "(detected)" if e else "(none)",
+                                  "data": e,
+                              })
                 progress.advance(task)
             else:
                 # CE: attempt webhooks gracefully
-                webhooks = self.portainer.list_webhooks()
-                if webhooks:
-                    discovery["webhooks"] = {
-                        "count": len(webhooks),
-                        "details": "",
-                        "edition": "CE",
-                        "data": webhooks,
-                    }
+                try:
+                    webhooks = self.portainer.list_webhooks()
+                    if webhooks:
+                        discovery["webhooks"] = {
+                            "count": len(webhooks),
+                            "details": "",
+                            "edition": "CE",
+                            "data": webhooks,
+                        }
+                except Exception as exc:
+                    self.logger.warning("CE webhook probe failed: %s", exc)
 
             # Settings (always export as reference)
-            settings = self.portainer.get_settings()
-            discovery["settings"] = {
-                "count": 1,
-                "details": "Exported for reference",
-                "edition": "CE + EE",
-                "data": settings,
-            }
+            _discover_one("settings", "CE + EE",
+                          self.portainer.get_settings,
+                          lambda s: {
+                              "count": 1,
+                              "details": "Exported for reference",
+                              "data": s,
+                          })
             progress.advance(task)
 
         self.discovery = discovery
