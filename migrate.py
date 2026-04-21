@@ -2113,15 +2113,20 @@ class MigrationEngine:
     def _transform_registry(self, reg: dict) -> dict:
         """Map Portainer registry to Arcane CreateContainerRegistryRequest.
 
-        Handles ECR special case (awsAccessKeyId, awsSecretAccessKey, awsRegion).
+        Arcane's CreateContainerRegistryRequest marks awsAccessKeyId,
+        awsSecretAccessKey, and awsRegion as REQUIRED for every registry
+        type — not just ECR. We therefore send them on every payload,
+        populated from Portainer's Ecr block when the registry is ECR and
+        as empty strings otherwise so the schema's required-fields
+        constraint is satisfied.
 
-        Arcane schema fields: url, username, token, description, insecure,
-        enabled, registryType, awsAccessKeyId, awsSecretAccessKey, awsRegion.
         Arcane has no ``name`` field for registries; ``description`` carries
-        the Portainer ``Name``.  Arcane's ``token`` field holds the password.
+        the Portainer ``Name``. Arcane's ``token`` field holds the password.
         """
         port_type = reg.get("Type", 1)
         registry_type = self.REGISTRY_TYPE_MAP.get(port_type, "custom")
+        ecr = reg.get("Ecr", {}) or {}
+        is_ecr = registry_type == "ecr"
 
         result: Dict[str, Any] = {
             "url": reg.get("URL", ""),
@@ -2131,14 +2136,10 @@ class MigrationEngine:
             "insecure": False,
             "enabled": True,
             "registryType": registry_type,
+            "awsAccessKeyId": ecr.get("AccessKeyID", "") if is_ecr else "",
+            "awsSecretAccessKey": ecr.get("SecretAccessKey", "") if is_ecr else "",
+            "awsRegion": ecr.get("Region", "") if is_ecr else "",
         }
-
-        # ECR special case
-        if registry_type == "ecr":
-            ecr = reg.get("Ecr", {}) or {}
-            result["awsAccessKeyId"] = ecr.get("AccessKeyID", "")
-            result["awsSecretAccessKey"] = ecr.get("SecretAccessKey", "")
-            result["awsRegion"] = ecr.get("Region", "")
 
         # Warn about registries that may need manual credential verification
         if port_type in (2, 3, 5):
