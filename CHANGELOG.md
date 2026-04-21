@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-21
+
+### Fixed
+- **Credentials no longer leak to the debug log**. `ArcaneClient._request`
+  and `MigrationEngine._execute_or_log` previously logged request bodies
+  verbatim, echoing registry passwords, user passwords, git tokens, and
+  AWS keys into the on-disk log file. Both paths now redact any value
+  under a secret-looking key.
+- **Checkpoint writes are atomic**. `_save_state` now writes to a sibling
+  temp file, fsyncs, and `os.replace`s. The previous non-atomic write
+  could be truncated by an interrupt, which combined with the silent
+  reset below caused every already-migrated item to be re-created on
+  `--resume`.
+- **A corrupt checkpoint fails loud** instead of silently falling back
+  to fresh state. The old behaviour produced duplicate Arcane resources.
+- **Portainer backup streams to disk** with a 600s timeout. The previous
+  in-memory `resp.content` at 120s OOM'd or timed out on real-world
+  installs.
+- **Arcane volume-backup upload timeout scales to file size** (10-minute
+  floor, 4-hour cap) instead of a fixed 60s that silently truncated
+  multi-GB tarballs.
+- **Every Arcane list endpoint now paginates**. Arcane's default page
+  size is 20; previously the tool silently stopped at 20 items per
+  resource type. Added `_list_paginated` that loops through the
+  start/limit response shape and wires it into `list_environments`,
+  `list_registries`, `list_git_repos`, `list_projects`, `list_networks`,
+  `list_volumes`, `list_containers`, `list_users`, `list_webhooks`,
+  `list_templates`.
+- **Silent stack compose-file fetch failures are now reported**. Previous
+  bare `except Exception` wrote an empty `docker-compose.yml` with no
+  warning. Now logs, records a migration failure, and warns the user.
+- **Volume-backup upload failures and container-start failures** are now
+  recorded as migration failures so the final report surfaces them.
+  Previously both were only warnings, producing reports that claimed
+  success for resources whose data or runtime state was actually missing.
+- **Transient Portainer errors retry with exponential backoff**.
+  `PortainerClient._get` retries `ConnectionError` / `Timeout` up to
+  three times (1s / 2s / 4s). HTTP 4xx/5xx are not retried.
+- **Discovery tolerates per-resource failure**. `MigrationEngine.discover`
+  records a "discovery failed" marker for a single flaky endpoint
+  instead of aborting the whole phase.
+- **403 on Portainer is surfaced as a warning** rather than silently
+  degrading to empty like 404 (which only means "EE-only endpoint
+  missing on CE"). A 403 usually means the API key is missing permission
+  and the data would otherwise be invisibly incomplete.
+- **Endpoint/environment pickers no longer clamp invalid input** — they
+  loop until a valid row number is entered. Clamping a destructive target
+  selection to the first/last row was a foot-gun.
+- **Dependency bootstrap no longer hides pip errors**. Dropped
+  `--quiet`, caught `EOFError` on non-TTY stdin, and replaced `os.execv`
+  with a subprocess spawn (Windows semantics for `os.execv` differ).
+- **Reverse-proxy HTML error pages now raise a clear message** instead
+  of an opaque `JSONDecodeError`.
+- **HTTP sessions close in a `finally` block** so connections don't
+  linger through Rich's terminal teardown.
+- **Checkpoint cleanup TOCTOU** — `os.remove(cp)` paths guard against
+  `FileNotFoundError`.
+
+### Changed
+- **`migrate.sh` Python detection** now probes
+  `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3`,
+  and `py -3` in addition to `PATH` entries. Previously a fresh macOS
+  without Homebrew's shims on `PATH` failed with "Python not found".
+- **`migrate.sh` pip failures are visible** (no more `--quiet`). Adds a
+  PEP 668 ("externally-managed-environment") hint when pip install fails,
+  so Ubuntu 24.04 / modern Homebrew users know to reach for a venv.
+- **`migrate.sh` Docker probe** distinguishes "Docker CLI missing" from
+  "daemon not running" from "socket permission denied" and prints the
+  relevant fix for each.
+- **Phase headers show a persistent [DRY RUN] or [EXPORT-ONLY] badge**
+  so the active mode is visible on every phase, not just at launch.
+- **Connection errors print targeted hints** (SSL, DNS, connection
+  refused, 401/403, timeout, http:// scheme) via a new
+  `WizardUI.diagnose_connection_error` helper.
+- **Rollback script instructions** surface in the final report so users
+  know to paste their Arcane API key in place of `YOUR_API_KEY_HERE`
+  before running `rollback.sh`.
+
 ## [0.3.0] - 2026-04-11
 
 ### Added

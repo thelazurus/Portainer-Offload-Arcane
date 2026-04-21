@@ -99,21 +99,47 @@ fi
 # ── Find Python ─────────────────────────────────────────────
 PYTHON=""
 
-for candidate in python3 python; do
-    if command -v "$candidate" &>/dev/null; then
-        # Verify it's actually Python 3.8+
-        version=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
-        major=$(echo "$version" | cut -d. -f1)
-        minor=$(echo "$version" | cut -d. -f2)
-        if [ "$major" -gt 3 ] || ([ "$major" -eq 3 ] && [ "$minor" -ge 8 ]); then
-            PYTHON="$candidate"
-            break
-        fi
+# Candidate list: PATH first, then well-known absolute locations for users
+# whose GUI shell environment doesn't include Homebrew / pyenv / etc.
+PYTHON_CANDIDATES=(
+    python3
+    python
+    /opt/homebrew/bin/python3       # Apple Silicon Homebrew
+    /usr/local/bin/python3          # Intel Mac Homebrew / Linux /usr/local
+    /usr/bin/python3                # system Python on Linux + macOS
+)
+
+for candidate in "${PYTHON_CANDIDATES[@]}"; do
+    # Use "command -v" for PATH entries, "-x" for absolute paths.
+    if [[ "$candidate" = /* ]]; then
+        [ -x "$candidate" ] || continue
+    else
+        command -v "$candidate" &>/dev/null || continue
+    fi
+    version=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+    major=$(echo "$version" | cut -d. -f1)
+    minor=$(echo "$version" | cut -d. -f2)
+    if [ "$major" -gt 3 ] || ([ "$major" -eq 3 ] && [ "$minor" -ge 8 ]); then
+        PYTHON="$candidate"
+        break
     fi
 done
 
+# Windows / Git Bash: try the "py" launcher as last resort.
+if [ -z "$PYTHON" ] && command -v py &>/dev/null; then
+    if py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)" &>/dev/null; then
+        PYTHON="py -3"
+    fi
+fi
+
 if [ -z "$PYTHON" ]; then
     fail "Python ${MIN_PYTHON}+ not found."
+    echo ""
+    echo "  Locations checked:"
+    for c in "${PYTHON_CANDIDATES[@]}"; do
+        echo "    - $c"
+    done
+    echo "    - py -3 (Windows launcher)"
     echo ""
     echo "  Install Python:"
     case "$(uname -s)" in
@@ -170,10 +196,26 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     answer="${answer:-y}"
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         echo ""
+        # Show pip output so failures (PEP 668 "externally-managed-environment",
+        # network errors, resolver conflicts) are visible instead of hidden
+        # behind --quiet and cascading into an opaque ImportError at launch.
         if [ -f "$REQUIREMENTS" ]; then
-            "$PYTHON" -m pip install --quiet -r "$REQUIREMENTS"
+            if ! $PYTHON -m pip install -r "$REQUIREMENTS"; then
+                fail "pip install failed — see output above."
+                echo ""
+                echo "  If you see 'externally-managed-environment' (PEP 668,"
+                echo "  common on Ubuntu 24.04 and recent Homebrew), retry with"
+                echo "  a virtualenv or --user:"
+                echo "    $PYTHON -m venv .venv && source .venv/bin/activate"
+                echo "    $PYTHON -m pip install -r $REQUIREMENTS"
+                echo ""
+                exit 1
+            fi
         else
-            "$PYTHON" -m pip install --quiet "${MISSING[@]}"
+            if ! $PYTHON -m pip install "${MISSING[@]}"; then
+                fail "pip install failed — see output above."
+                exit 1
+            fi
         fi
         success "Dependencies installed"
     else
@@ -186,13 +228,37 @@ fi
 
 # ── Check Docker (optional) ─────────────────────────────────
 echo ""
-if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-    DOCKER_VERSION=$(docker --version 2>&1 | head -1)
-    success "Docker available (${DIM}${DOCKER_VERSION}${RESET})"
-    info "Volume data backup will be available"
+if ! command -v docker &>/dev/null; then
+    warn "Docker CLI not installed — volume data backup disabled"
+    info "Install Docker if you want volume tarballs. API-only migration"
+    info "still works for stacks, configs, and metadata."
 else
-    warn "Docker not available — volume data backup disabled"
-    info "API-only migration mode (stacks, configs, metadata still work)"
+    DOCKER_VERSION=$(docker --version 2>&1 | head -1)
+    # Capture the exact docker info failure so the user knows whether the
+    # daemon is down, their socket is permission-denied, or some other issue.
+    DOCKER_INFO_ERR=$(docker info 2>&1 >/dev/null) || DOCKER_INFO_STATUS=$?
+    if [ -z "${DOCKER_INFO_STATUS:-}" ]; then
+        success "Docker available (${DIM}${DOCKER_VERSION}${RESET})"
+        info "Volume data backup will be available"
+    else
+        warn "Docker installed but 'docker info' failed — volume backup disabled"
+        # Surface the error so the user can fix the root cause instead of
+        # guessing between daemon down / permissions / network.
+        if echo "$DOCKER_INFO_ERR" | grep -qi "permission denied"; then
+            info "Socket permission denied. Add your user to the docker group:"
+            info "    sudo usermod -aG docker \$USER   (then re-login)"
+        elif echo "$DOCKER_INFO_ERR" | grep -qi "cannot connect\|is the docker daemon running\|failed to connect\|no such file or directory"; then
+            info "Docker daemon doesn't appear to be running:"
+            case "$(uname -s)" in
+                Darwin*) info "    open -a 'Docker Desktop'" ;;
+                Linux*)  info "    sudo systemctl start docker" ;;
+            esac
+        else
+            info "docker info said:"
+            echo "$DOCKER_INFO_ERR" | sed 's/^/      /' | head -5
+        fi
+        info "API-only migration still works for stacks/configs/metadata."
+    fi
 fi
 
 # ── Check-only exit ─────────────────────────────────────────

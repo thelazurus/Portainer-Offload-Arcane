@@ -11,7 +11,7 @@ Usage:
 See --help for full option list.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap -- runs before any third-party imports
@@ -186,7 +186,10 @@ class Config:
     arcane_ssl_verify: bool = True
 
     # -- Options -----------------------------------------------------------
-    strategy: str = "export"
+    # Empty until resolved by --export-only, --import-dir, or the strategy
+    # prompt — so the mode badge doesn't falsely advertise EXPORT-ONLY on
+    # early phase headers before the user actually picks.
+    strategy: str = ""
     dry_run: bool = False
     backup_dir: str = "./migration_export"
     log_file: str = ""
@@ -865,10 +868,20 @@ class WizardUI:
             )
         )
 
+    def _mode_badge(self) -> str:
+        """Return a persistent [MODE] badge for phase headers so the user
+        can't forget mid-session that dry-run or export-only is active."""
+        if self.config.dry_run:
+            return "[bold yellow][DRY RUN][/bold yellow] "
+        if getattr(self.config, "strategy", "") == "export":
+            return "[bold magenta][EXPORT-ONLY][/bold magenta] "
+        return ""
+
     def phase_header(self, phase_num, total: int, title: str):
         """Display phase separator. phase_num can be int or string like '1.5'."""
         self.console.print()
         self.console.rule(
+            f"{self._mode_badge()}"
             f"[bold blue]Phase {phase_num} of {total}: {title}[/bold blue]"
         )
         self.console.print()
@@ -894,6 +907,49 @@ class WizardUI:
     def dry_run_msg(self, msg: str):
         """Display a dry-run notice."""
         self.console.print(f"  [yellow][DRY RUN][/yellow] Would {msg}")
+
+    def diagnose_connection_error(self, label: str, url: str, exc: Exception):
+        """Print a targeted hint for common connection failure modes so the
+        user isn't left guessing whether the issue is DNS, port, scheme,
+        SSL, or a bad API key. *label* is "Portainer" or "Arcane"."""
+        self.error(f"Cannot connect to {label} ({url}): {exc}")
+        msg = str(exc).lower()
+        cls = exc.__class__.__name__
+        if "ssl" in msg or "certificate" in msg:
+            self.info(
+                f"SSL/TLS error. If {label} uses a self-signed cert, "
+                f"answer 'n' at 'Verify SSL?' on the connection prompt."
+            )
+        elif "nameresolution" in msg or "name or service not known" in msg \
+                or "nodename nor servname" in msg:
+            self.info(
+                f"DNS resolution failed. Check the hostname in the {label} URL."
+            )
+        elif "connection refused" in msg:
+            self.info(
+                f"TCP connection refused. Check the port and that "
+                f"{label} is running on that port."
+            )
+        elif "401" in msg or "unauthorized" in msg:
+            self.info(
+                f"Authentication rejected. Your {label} API key/token may "
+                f"be invalid, expired, or lack permission."
+            )
+        elif "403" in msg or "forbidden" in msg:
+            self.info(
+                f"Access denied. Your {label} API key lacks permission "
+                f"for this endpoint."
+            )
+        elif cls in ("Timeout", "ConnectTimeout", "ReadTimeout"):
+            self.info(
+                f"{label} did not respond within the timeout. Check that the "
+                f"host is reachable and not overloaded."
+            )
+        elif url.startswith("http://"):
+            self.info(
+                f"URL uses http://. Most production {label} instances serve "
+                f"on https:// — try changing the scheme."
+            )
 
     # -- Edition panel -----------------------------------------------------
 
@@ -1112,7 +1168,7 @@ class WizardUI:
         self.config.strategy = Prompt.ask(
             "  [blue]Strategy[/blue] (export = files only, live = export + import)",
             choices=["export", "live"],
-            default=self.config.strategy,
+            default=self.config.strategy or "export",
         )
         self.config.dry_run = Confirm.ask(
             "  [blue]Enable dry-run mode?[/blue] (simulate without changes)",
@@ -3457,7 +3513,9 @@ class MigrationEngine:
                     )
                     self.ui.success(f"Connected to Arcane v{version_str}")
                 except Exception as exc:
-                    self.ui.error(f"Cannot connect to Arcane: {exc}")
+                    self.ui.diagnose_connection_error(
+                        "Arcane", self.config.arcane_url, exc
+                    )
                     return
 
                 # Select Arcane environment
@@ -3503,7 +3561,9 @@ class MigrationEngine:
                     self.portainer.test_connection()
                     self.ui.success(f"Connected to Portainer at {self.config.portainer_url}")
                 except Exception as exc:
-                    self.ui.error(f"Cannot connect to Portainer: {exc}")
+                    self.ui.diagnose_connection_error(
+                        "Portainer", self.config.portainer_url, exc
+                    )
                     return
 
                 try:
@@ -3564,7 +3624,9 @@ class MigrationEngine:
                     )
                     self.ui.success(f"Connected to Arcane v{version_str}")
                 except Exception as exc:
-                    self.ui.error(f"Cannot connect to Arcane: {exc}")
+                    self.ui.diagnose_connection_error(
+                        "Arcane", self.config.arcane_url, exc
+                    )
                     return
 
                 # Select Arcane environment
@@ -3698,6 +3760,17 @@ class MigrationEngine:
             )
             if rollback_file:
                 self.ui.info(f"Rollback script: {rollback_file}")
+                # The generated script ships with a placeholder API key so
+                # no credentials are written to disk. Users must paste
+                # their Arcane key before running it, otherwise every
+                # curl call 401s silently from inside `set -euo pipefail`.
+                self.console.print(
+                    "\n[bold yellow]Before running rollback:[/bold yellow]\n"
+                    f"  1. Edit [cyan]{rollback_file}[/cyan] and replace "
+                    "[magenta]YOUR_API_KEY_HERE[/magenta] with your Arcane API key.\n"
+                    f"  2. Review the DELETE commands — rollback is destructive.\n"
+                    f"  3. Run: [cyan]bash {rollback_file}[/cyan]"
+                )
 
             # Check if all phases completed
             all_done = all(
