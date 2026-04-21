@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-04-21
 
 ### Fixed
+- **Arcane registry payload now includes AWS fields on every registry
+  type**. `CreateContainerRegistryRequest` marks `awsAccessKeyId`,
+  `awsSecretAccessKey`, and `awsRegion` as required fields for every
+  registry type, not just ECR. `_transform_registry` previously omitted
+  them for Docker Hub / Quay / Azure ACR / GitLab / custom registries,
+  so every non-ECR POST violated the schema. The three fields are now
+  always present — populated from Portainer's `Ecr` block for ECR,
+  empty strings otherwise.
 - **Credentials no longer leak to the debug log**. `ArcaneClient._request`
   and `MigrationEngine._execute_or_log` previously logged request bodies
   verbatim, echoing registry passwords, user passwords, git tokens, and
