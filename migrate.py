@@ -544,6 +544,62 @@ class ArcaneClient:
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return self._request("GET", path, params=params)
 
+    def _list_paginated(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """GET a paginated Arcane list endpoint, looping until exhausted.
+
+        Arcane list endpoints default to limit=20 and return responses
+        shaped ``{success, data, pagination}`` where pagination carries
+        ``totalItems`` / ``itemsPerPage`` / ``currentPage``. Without this
+        loop, the tool would silently stop at the first 20 items on any
+        install with more than that — a silent migration truncation.
+
+        We bypass ``_request``'s auto-unwrap by calling the HTTP layer
+        directly, so we can read the pagination sibling field.
+        """
+        url = f"{self.base_url}{path}"
+        headers = self._auth_headers()
+        items: List[Dict[str, Any]] = []
+        start = 0
+        while True:
+            page_params = dict(params or {})
+            page_params["start"] = start
+            page_params["limit"] = page_size
+            self.logger.debug(
+                "GET %s params=%s", url, _redact_sensitive(page_params)
+            )
+            resp = self.session.get(
+                url, headers=headers, params=page_params, timeout=60
+            )
+            resp.raise_for_status()
+            if resp.status_code == 204 or not resp.content:
+                break
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Expected JSON from {url}: {resp.text[:200]}"
+                ) from exc
+            if not isinstance(body, dict):
+                # Endpoint returned a bare list (non-paginated) — just use it.
+                if isinstance(body, list):
+                    items.extend(body)
+                break
+            page = body.get("data") or []
+            items.extend(page)
+            pagination = body.get("pagination") or {}
+            total = pagination.get("totalItems")
+            if total is not None and len(items) >= total:
+                break
+            if not page or len(page) < page_size:
+                break
+            start += page_size
+        return items
+
     def _post(
         self,
         path: str,
@@ -584,7 +640,7 @@ class ArcaneClient:
     # -- Environments ------------------------------------------------------
 
     def list_environments(self) -> List[Dict[str, Any]]:
-        return self._get("/environments")
+        return self._list_paginated("/environments")
 
     def get_environment(self, eid: str) -> Dict[str, Any]:
         return self._get(f"/environments/{eid}")
@@ -592,7 +648,7 @@ class ArcaneClient:
     # -- Registries --------------------------------------------------------
 
     def list_registries(self) -> List[Dict[str, Any]]:
-        return self._get("/container-registries")
+        return self._list_paginated("/container-registries")
 
     def create_registry(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/container-registries", json_data=data)
@@ -600,7 +656,7 @@ class ArcaneClient:
     # -- Git repos ---------------------------------------------------------
 
     def list_git_repos(self) -> List[Dict[str, Any]]:
-        return self._get("/customize/git-repositories")
+        return self._list_paginated("/customize/git-repositories")
 
     def create_git_repo(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/customize/git-repositories", json_data=data)
@@ -608,7 +664,7 @@ class ArcaneClient:
     # -- Projects ----------------------------------------------------------
 
     def list_projects(self, eid: str) -> List[Dict[str, Any]]:
-        return self._get(f"/environments/{eid}/projects")
+        return self._list_paginated(f"/environments/{eid}/projects")
 
     def create_project(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/projects", json_data=data)
@@ -621,7 +677,7 @@ class ArcaneClient:
     # -- Networks ----------------------------------------------------------
 
     def list_networks(self, eid: str) -> List[Dict[str, Any]]:
-        return self._get(f"/environments/{eid}/networks")
+        return self._list_paginated(f"/environments/{eid}/networks")
 
     def create_network(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/networks", json_data=data)
@@ -629,7 +685,7 @@ class ArcaneClient:
     # -- Volumes -----------------------------------------------------------
 
     def list_volumes(self, eid: str) -> List[Dict[str, Any]]:
-        return self._get(f"/environments/{eid}/volumes")
+        return self._list_paginated(f"/environments/{eid}/volumes")
 
     def create_volume(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/volumes", json_data=data)
@@ -655,7 +711,7 @@ class ArcaneClient:
     # -- Containers --------------------------------------------------------
 
     def list_containers(self, eid: str) -> List[Dict[str, Any]]:
-        return self._get(f"/environments/{eid}/containers")
+        return self._list_paginated(f"/environments/{eid}/containers")
 
     def create_container(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/containers", json_data=data)
@@ -666,7 +722,7 @@ class ArcaneClient:
     # -- Users -------------------------------------------------------------
 
     def list_users(self) -> List[Dict[str, Any]]:
-        return self._get("/users")
+        return self._list_paginated("/users")
 
     def create_user(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/users", json_data=data)
@@ -674,7 +730,7 @@ class ArcaneClient:
     # -- Webhooks ----------------------------------------------------------
 
     def list_webhooks(self, eid: str) -> List[Dict[str, Any]]:
-        return self._get(f"/environments/{eid}/webhooks")
+        return self._list_paginated(f"/environments/{eid}/webhooks")
 
     def create_webhook(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post(f"/environments/{eid}/webhooks", json_data=data)
@@ -682,7 +738,7 @@ class ArcaneClient:
     # -- Templates ---------------------------------------------------------
 
     def list_templates(self) -> List[Dict[str, Any]]:
-        return self._get("/templates")
+        return self._list_paginated("/templates")
 
     def create_template(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/templates", json_data=data)
