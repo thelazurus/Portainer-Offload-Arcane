@@ -11,7 +11,7 @@ Usage:
 See --help for full option list.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap -- runs before any third-party imports
@@ -193,6 +193,11 @@ class Config:
     dry_run: bool = False
     backup_dir: str = "./migration_export"
     log_file: str = ""
+    # True when Portainer and Arcane manage the same Docker daemon: a named
+    # volume created/adopted by Arcane under that name IS the source volume
+    # on disk (Docker volume-create is idempotent and doesn't touch existing
+    # data), so no tar.gz export/upload round-trip is needed to move its data.
+    same_docker_host: bool = False
 
     # -- Runtime -----------------------------------------------------------
     docker_socket: str = ""
@@ -670,7 +675,24 @@ class ArcaneClient:
         return self._list_paginated(f"/environments/{eid}/projects")
 
     def create_project(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._post(f"/environments/{eid}/projects", json_data=data)
+        # Arcane's POST /environments/{id}/projects takes multipart/form-data,
+        # not JSON -- the request body carries a compose-file upload alongside
+        # metadata. The "project" and "manifest" fields are JSON-encoded text
+        # parts (no filename, so Go's multipart parser routes them into
+        # form.Value rather than form.File); "manifest" must be present even
+        # when there are no workspace file uploads to apply.
+        project_fields: Dict[str, Any] = {
+            "name": data.get("name", ""),
+            "composeContent": data.get("composeContent", ""),
+        }
+        env_content = data.get("envContent")
+        if env_content:
+            project_fields["envContent"] = env_content
+        files = {
+            "project": (None, json.dumps(project_fields), "application/json"),
+            "manifest": (None, json.dumps({"fileChanges": []}), "application/json"),
+        }
+        return self._post(f"/environments/{eid}/projects", files=files)
 
     # -- GitOps ------------------------------------------------------------
 
@@ -729,6 +751,19 @@ class ArcaneClient:
 
     def create_user(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/users", json_data=data)
+
+    def set_user_role_assignments(self, user_id: str, role_id: str) -> Dict[str, Any]:
+        """PUT /users/{id}/role-assignments -- replaces manual role grants.
+
+        Arcane's RBAC role-assignment API is separate from user creation.
+        This replaces the full set of manual assignments for the user, so
+        one call with a single assignment is sufficient right after create.
+        """
+        return self._request(
+            "PUT",
+            f"/users/{user_id}/role-assignments",
+            json_data={"assignments": [{"roleId": role_id}]},
+        )
 
     # -- Webhooks ----------------------------------------------------------
 
@@ -1178,6 +1213,14 @@ class WizardUI:
             "  [blue]Backup / export directory[/blue]",
             default=self.config.backup_dir,
         )
+
+        if self.config.strategy == "live" and self.config.has_docker:
+            self.config.same_docker_host = Confirm.ask(
+                "  [blue]Do Portainer and Arcane manage the same Docker host?[/blue] "
+                "(same daemon -- volume data is already there; skips the "
+                "backup-upload step, which current Arcane rejects anyway)",
+                default=self.config.same_docker_host,
+            )
 
     def ask_scope_confirmation(self, discovery: dict, edition: str) -> bool:
         """Ask 'Migrate ALL?' If no, show per-type selection. Return True if any selected."""
@@ -2396,23 +2439,33 @@ class MigrationEngine:
             "envContent": "",
         }
 
+    # Arcane's built-in role IDs are fixed Go constants, not per-instance
+    # data (backend/pkg/authz/permissions.go). Arcane's own legacy-user
+    # backfill (RoleService.BackfillLegacyRoleAssignments) maps its old
+    # single admin-bool onto exactly these two roles, so we mirror that
+    # convention instead of inventing our own.
+    ARCANE_ROLE_ADMIN = "role_admin"
+    ARCANE_ROLE_NON_ADMIN = "role_viewer"
+
     def _transform_user(self, user: dict) -> dict:
-        """Map Portainer user to Arcane user create payload.
+        """Map Portainer user to Arcane CreateUser payload.
 
-        Role mapping: 1 = admin, 2 = user.
-        Passwords cannot be migrated -- uses a default placeholder.
+        Current Arcane's POST /users no longer accepts an inline ``roles``
+        array (RBAC role assignment is a separate API -- see
+        ``_arcane_role_for_portainer_user`` / the PUT
+        /users/{id}/role-assignments call in ``_migrate_users``).
+        Passwords cannot be migrated -- uses a random placeholder.
         """
-        role = user.get("Role", 2)
-        if role == 1:
-            roles = ["admin"]
-        else:
-            roles = ["user"]
-
         return {
             "username": user.get("Username", ""),
             "password": secrets.token_urlsafe(16),
-            "roles": roles,
         }
+
+    def _arcane_role_for_portainer_user(self, user: dict) -> str:
+        """Map a Portainer user's role (1 = admin, 2 = user) to an Arcane
+        built-in role ID for the post-creation role-assignment call."""
+        role = user.get("Role", 2)
+        return self.ARCANE_ROLE_ADMIN if role == 1 else self.ARCANE_ROLE_NON_ADMIN
 
     # ------------------------------------------------------------------
     # Task 10: Export to Disk
@@ -2820,11 +2873,35 @@ class MigrationEngine:
         eid = self.config.arcane_environment_id
         networks = self.discovery.get("networks", {}).get("data", [])
 
+        # Same-host migrations share a Docker daemon with Portainer, so a
+        # network Arcane already sees isn't a failure to report -- Arcane's
+        # create endpoint always wraps the Docker "already exists" error as
+        # a generic 500, so we can't distinguish it from a real failure by
+        # status code. Pre-check by name instead and adopt the existing one.
+        try:
+            existing_networks = (
+                self.arcane.list_networks(eid) if not self.config.dry_run else []
+            )
+        except Exception:
+            existing_networks = []
+        existing_network_ids = {
+            n.get("name", "").lower(): n.get("id", "")
+            for n in existing_networks
+            if n.get("name")
+        }
+
         for net in networks:
             net_id = net.get("Id", "")
             name = net.get("Name", net_id)
             if self._is_migrated(phase, net_id):
                 self.report.record_skip("Networks", name, "already migrated")
+                continue
+            if name.lower() in existing_network_ids:
+                self.report.record_skip(
+                    "Networks", name, "already exists on target -- adopted"
+                )
+                self.ui.info(f"Network '{name}' already exists on target -- adopted")
+                self._record_migrated(phase, net_id)
                 continue
             try:
                 payload = self._transform_network(net)
@@ -2865,6 +2942,12 @@ class MigrationEngine:
         eid = self.config.arcane_environment_id
         volumes = self.discovery.get("volumes", {}).get("data", [])
 
+        if self.config.same_docker_host:
+            self.ui.info(
+                "Same Docker host: volume data is already on the shared "
+                "daemon -- skipping backup upload for all volumes"
+            )
+
         for vol in volumes:
             name = vol.get("Name", "")
             if self._is_migrated(phase, name):
@@ -2891,11 +2974,21 @@ class MigrationEngine:
                         f"{self.arcane.base_url}/environments/{eid}/volumes/{name}",
                         f"Delete volume '{name}'",
                     )
-                # Upload backup if it exists
+                # Upload backup if it exists. Skipped entirely on a same-host
+                # migration: the volume Arcane just created/adopted above IS
+                # the source volume on disk (Docker volume-create is
+                # idempotent and never touches existing data), so there is
+                # nothing to transfer -- and current Arcane's upload-restore
+                # endpoint rejects every valid archive anyway (its BusyBox
+                # helper image's `find` doesn't support `-quit`).
                 backup_file = (
                     Path(self.config.backup_dir) / "volumes" / "backups" / f"{name}.tar.gz"
                 )
-                if backup_file.is_file() and not self.config.dry_run:
+                if (
+                    not self.config.same_docker_host
+                    and backup_file.is_file()
+                    and not self.config.dry_run
+                ):
                     try:
                         self.arcane.upload_volume_backup(eid, name, str(backup_file))
                         self.ui.success(f"Volume '{name}' backup restored")
@@ -3052,6 +3145,21 @@ class MigrationEngine:
         eid = self.config.arcane_environment_id
         containers = self.discovery.get("standalone_containers", {}).get("data", [])
 
+        # Same-host migrations share a Docker daemon with Portainer, so a
+        # container name may already exist on the target. Pre-check and
+        # adopt it instead of hitting Arcane's 409 Conflict as a hard
+        # failure (same pattern as _migrate_networks).
+        try:
+            existing_containers = (
+                self.arcane.list_containers(eid) if not self.config.dry_run else []
+            )
+        except Exception:
+            existing_containers = []
+        existing_container_ids: Dict[str, str] = {}
+        for ec in existing_containers:
+            for nm in (ec.get("names") or []):
+                existing_container_ids[nm.lstrip("/").lower()] = ec.get("id", "")
+
         for c in containers:
             cid = c.get("Id", "")
             # Use first name (strip leading /) or fall back to short id
@@ -3060,12 +3168,40 @@ class MigrationEngine:
             if self._is_migrated(phase, cid):
                 self.report.record_skip("Containers", name, "already migrated")
                 continue
+            if name.lower() in existing_container_ids:
+                self.report.record_skip(
+                    "Containers", name, "already exists on target -- adopted"
+                )
+                self.ui.info(f"Container '{name}' already exists on target -- adopted")
+                self._record_migrated(phase, cid)
+                continue
             try:
                 if self.config.import_mode:
                     # In import mode, the standalone.json already contains inspect data
                     inspect_data = c
                 else:
-                    inspect_data = self.portainer.inspect_container(cid)
+                    # Re-fetch live rather than trusting the discovery-time
+                    # listing: short-lived/auto-named containers can vanish
+                    # between discovery and execution. A 404 here means the
+                    # container is gone, not that migration failed.
+                    try:
+                        inspect_data = self.portainer.inspect_container(cid)
+                    except http_requests.exceptions.HTTPError as exc:
+                        status = (
+                            exc.response.status_code
+                            if exc.response is not None
+                            else None
+                        )
+                        if status == 404:
+                            self.report.record_skip(
+                                "Containers", name, "no longer present on source"
+                            )
+                            self.ui.info(
+                                f"Container '{name}' no longer present on source -- skipped"
+                            )
+                            self._record_migrated(phase, cid)
+                            continue
+                        raise
                 payload = self._transform_container(inspect_data)
                 result = self._execute_or_log(
                     f"Create container '{name}'",
@@ -3215,6 +3351,28 @@ class MigrationEngine:
                         "DELETE",
                         f"{self.arcane.base_url}/users/{target_id}",
                         f"Delete user '{username}'",
+                    )
+                # Role assignment is a separate RBAC call in current Arcane
+                # (POST /users no longer accepts an inline roles array). A
+                # failure here shouldn't undo the user that was already
+                # created -- fall back to a manual action item instead.
+                role_id = self._arcane_role_for_portainer_user(user)
+                if target_id and not self.config.dry_run:
+                    try:
+                        self.arcane.set_user_role_assignments(target_id, role_id)
+                    except Exception as role_exc:
+                        self.logger.error(
+                            "Role assignment failed for user %s: %s",
+                            username, role_exc,
+                        )
+                        self.report.add_action_item(
+                            f"User '{username}' was created but role assignment "
+                            f"('{role_id}') FAILED ({role_exc}) -- assign a role "
+                            "manually in Arcane admin"
+                        )
+                elif self.config.dry_run:
+                    self.ui.dry_run_msg(
+                        f"Assign role '{role_id}' to user '{username}'"
                     )
                 self.report.add_action_item(
                     f"User '{username}' was created with a random password -- set a new password via Arcane admin"
@@ -3765,7 +3923,7 @@ class MigrationEngine:
                 # no credentials are written to disk. Users must paste
                 # their Arcane key before running it, otherwise every
                 # curl call 401s silently from inside `set -euo pipefail`.
-                self.console.print(
+                self.ui.console.print(
                     "\n[bold yellow]Before running rollback:[/bold yellow]\n"
                     f"  1. Edit [cyan]{rollback_file}[/cyan] and replace "
                     "[magenta]YOUR_API_KEY_HERE[/magenta] with your Arcane API key.\n"

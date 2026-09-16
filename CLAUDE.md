@@ -44,8 +44,28 @@ migrate.py
 - Base URL: `{arcane_url}/api`
 - Auth: `X-API-Key` header OR `Authorization: Bearer {jwt}`
 - Environment ID "0" = local environment
-- Projects (stacks): `POST /environments/{id}/projects` with `composeContent` + `envContent`
+- Projects (stacks): `POST /environments/{id}/projects` is `multipart/form-data`,
+  not JSON -- `project` and `manifest` are JSON-encoded text parts (sent with
+  no filename so Go's multipart parser routes them into `form.Value`, not
+  `form.File`). `project` carries `name`/`composeContent`/`envContent`/`tags`;
+  `manifest` carries `{"fileChanges": []}` when there are no separate
+  workspace files to apply -- compose/env content is written directly from
+  `project`, not through the manifest's file-change mechanism.
 - Env vars are a raw `.env` string in `envContent` field, not an array
+- Users: `POST /users` takes `username`/`password` (+ optional
+  displayName/email/locale/timeFormat) only -- no inline `roles`. Role
+  assignment is a separate call: `PUT /users/{id}/role-assignments` with
+  `{"assignments": [{"roleId": "role_admin"}]}` (built-in role IDs are Go
+  constants upstream, e.g. `role_admin` / `role_viewer` --
+  `backend/pkg/authz/permissions.go`).
+- Volume backup upload (`POST /environments/{id}/volumes/{name}/backups/upload`)
+  is broken upstream as of v2.12.0: its restore-validation step execs
+  `find <dir> -quit` inside a BusyBox-based helper image (`ghcr.io/getarcaneapp/tools`)
+  whose `find` doesn't support `-quit`, so every valid upload is rejected
+  server-side. Not our bug to fix here (separate upstream repo) -- on a
+  same-host migration it's also unnecessary: `docker volume create` is
+  idempotent and never touches existing data, so once Arcane adopts a volume
+  by name its contents are already correct, no upload required.
 
 ## Common Operations
 

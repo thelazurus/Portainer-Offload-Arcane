@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-16
+
+### Fixed
+- **Stack/project creation matches current Arcane's multipart schema**.
+  `POST /environments/{id}/projects` now requires `multipart/form-data`
+  (Arcane's project handler accepts a compose-file upload alongside
+  metadata), not a JSON body — every stack migration was failing with
+  `422 Unprocessable Entity: cannot read multipart form: request
+  Content-Type isn't multipart/form-data`. `ArcaneClient.create_project`
+  now sends `project` and `manifest` as JSON-encoded multipart text parts;
+  `manifest.fileChanges` is empty since compose/env content is written
+  directly from the `project` part, not through the workspace
+  file-change mechanism.
+- **User creation matches current Arcane's RBAC schema**. `POST /users`
+  no longer accepts an inline `roles` array (`422 Unprocessable Entity:
+  unexpected property "roles"`) — role assignment is a separate API.
+  `ArcaneClient.create_user` no longer sends `roles`; a new
+  `set_user_role_assignments()` calls `PUT /users/{id}/role-assignments`
+  with Arcane's built-in `role_admin` / `role_viewer` role IDs right
+  after creation. A role-assignment failure no longer undoes the
+  created user — it's recorded as a manual action item instead.
+- **Network "already exists" on same-host migrations no longer fails
+  the migration**. Arcane wraps every network-create error (including a
+  name collision) as a generic `500`, so the previous code couldn't
+  distinguish "already there" from a real failure. `_migrate_networks`
+  now lists Arcane's existing networks first and adopts a name match
+  instead of attempting (and failing) a duplicate create.
+- **Container name conflicts and stale references are told apart and
+  handled**. `_migrate_containers` now pre-lists Arcane's existing
+  containers and adopts a name match (same pattern as networks) instead
+  of hitting a `409 Conflict`. Separately, a container is now
+  re-inspected live against Portainer immediately before migrating
+  rather than trusting the discovery-time snapshot; a `404` there (an
+  ephemeral, auto-named container that's since exited) is recorded as
+  "no longer present on source" instead of a hard failure.
+- **Post-run rollback instructions no longer crash**. The final "Before
+  running rollback" print referenced `self.console`, which doesn't
+  exist on `MigrationEngine` — every run with a rollback script silently
+  lost those instructions to an `AttributeError` after the report had
+  already been written. Fixed to use `self.ui.console`.
+
+### Added
+- **Same-Docker-host volume migration skips the doomed backup upload**.
+  Current Arcane's volume-backup-upload endpoint rejects every valid
+  archive (`uploaded archive appears empty or invalid: find: unrecognized:
+  -quit` — its helper image's BusyBox `find` doesn't support the
+  GNU-only `-quit` flag, an upstream Arcane bug). When Portainer and
+  Arcane share a Docker daemon, `docker volume create` is idempotent and
+  never touches existing data, so a same-host migration doesn't need to
+  transfer volume data at all — Arcane adopts the volume in place. The
+  wizard now asks (in live mode, when local Docker is available)
+  whether Portainer and Arcane share a host; if so, `_migrate_volumes`
+  skips the tar.gz export/upload/restore round-trip entirely.
+
 ## [0.4.0] - 2026-04-21
 
 ### Fixed
